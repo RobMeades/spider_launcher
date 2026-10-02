@@ -10,5 +10,4 @@ All parts should be printed in \[black\] ASA, 15% in-fill, fastest speed, no sup
 - `spider_launcher_pole_bug_eyes.stl`: best sliced in half, width-wise, in your printer's slicer program, then both halves can be placed on their cut faces, printed (at 0.1&nbsp;mm layer for best curves) with supports on the print bed and cyanoacrylated together afterwards,
 - `spider_launcher_pole_top_bracket.stl`: similarly, can be chopped into two, in the middle of the thickest part, in your printer's slicer program, then the two parts can be cyanoacrylated together afterwards,
 - `spider_launcher_winch_mount_motor_side.stl`: there is no way around having supports everywhere for this one,
-- `spider_launcher_winch_mount_non-motor_side_upper.stl`: will also require supports everywhere,
-- `spider_launcher_winch_mount_non-motor_side_lower.stl`, `spider_launcher_winch_wheel.stl` and `spider_launcher_winch_wheel_nylon_line_bead_x2.stl` will require supports on the print bed.
+- `spider_launcher_winch_mount_non-motor_side_upper.stl`, `spider_launcher_winch_mount_non-motor_side_lower.stl`, `spider_launcher_winch_wheel.stl` and `spider_launcher_winch_wheel_nylon_line_bead_x2.stl` will require supports on the print bed.
