@@ -1,0 +1,12 @@
+{
+    "idf.currentSetup": "/home/robmeades/.espressif/v5.5.2/esp-idf",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "clangd.path": "/home/robmeades/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=/mnt/windows/temp/spider_launcher/software/esp32/application/build"
+    ]
+}

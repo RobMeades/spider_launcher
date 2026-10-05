@@ -1,0 +1,51 @@
+menu "Application Configuration"
+
+    config SPIDER_LAUNCHER_DEBUG_LED_PIN
+        int "Debug LED pin"
+        default 9
+        help
+            The pin where a debug LED is connected
+
+    config SPIDER_LAUNCHER_MOTOR_DIRECTION_PIN
+        int "Motor direction pin"
+        default 8
+        help
+            Pin wired to the DIR1 pin of the MDD10A motor driver board
+
+    config SPIDER_LAUNCHER_MOTOR_PWM_PIN
+        int "Motor PWM pin"
+        default 7
+        help
+            Pin wired to the PWM1 pin of the MDD10A motor driver board
+
+    config SPIDER_LAUNCHER_QRD1114_PIN
+        int "QRD1114 pin"
+        default 6
+        help
+            Pin wired to the output of the QRD1114 sensor
+
+    config SPIDER_LAUNCHER_AUDIO_UART_TXD_PIN
+        int "Audio TXD pin"
+        default 43
+        help
+            UART TX pin wired to the DY-HV8F audio board
+
+    config SPIDER_LAUNCHER_AUDIO_UART_RXD_PIN
+        int "Audio RXD pin"
+        default 44
+        help
+            UART RX pin wired to the DY-HV8F audio board
+
+    config SPIDER_LAUNCHER_UART_NUM
+        int "Audio UART number"
+        default 1
+        help
+            UART number to use for communications with the DY-HV8F audio board
+
+    config SPIDER_LAUNCHER_UART_BAUD_RATE
+        int "UART baud rate"
+        default 9600
+        help
+            Baud rate on the UART talking to the DY-HV8F audio board
+
+endmenu

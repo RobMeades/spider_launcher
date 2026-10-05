@@ -1,0 +1,56 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# Enable stack checking in all functions to catch memory corruption early
+CONFIG_COMPILER_STACK_CHECK_MODE_ALL=y
+# Verify all flash writes to ensure data integrity
+CONFIG_SPI_FLASH_VERIFY_WRITE=y
+# Explicitly disable NVS encryption to keep the storage simple and robust
+CONFIG_NVS_ENCRYPTION=n
+
+# Enable the Interrupt WDT to catch blocked interrupts (default anyway, but just in case)
+CONFIG_ESP_INT_WDT=y
+# Enable the Task WDT to catch stuck tasks (default anyway, but just in case)
+CONFIG_ESP_TASK_WDT_INIT=y
+# 15 second watchog time
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+# Make the Task WDT cause a panic (and thus a reset) on timeout
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# Enable core dumps (needs coredump region of size at least 64 kbytes in partitions.csv)
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+
+# Enable comprehensive heap corruption detection
+CONFIG_HEAP_POISONING_COMPREHENSIVE=y
+
+# Use a custom partition table for best use of the 8 Mbyte flash
+CONFIG_PARTITION_TABLE_CUSTOM=y
+
+# Force an 8 Mbyte flash size, in case of misdetection
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# multi-colour LED on GPIO 9
+CONFIG_FGR_DEBUG_LED_WS2812_GRB=y
+CONFIG_FGR_DEBUG_LED_PIN=9
+
+# PSRAM configuration for Seeed Studio boards
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_ESPPSRAM64=y
+
+# A lower speed is suggested
+CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# Make almost everything from the application go to PSRAM (FreeRTOS will still allocate from RAM)
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=64
+
+# Reserve 128KB of internal RAM for system components (e.g. WiFi, or it may silently fail)
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=131072
+
+# Bluetooth
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y

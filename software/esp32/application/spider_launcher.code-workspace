@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../components"
+		}
+	],
+    "settings": {
+        "C_Cpp.default.compileCommands": "${workspaceFolder:test}/build/compile_commands.json"
+    }
+}
