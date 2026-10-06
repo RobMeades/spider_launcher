@@ -98,6 +98,10 @@
 // Default value for "random enable".
 #define DEFAULT_RANDOM_ENABLE true
 
+// How many mm of height is represented by one step (i.e. the distance
+// between two QRD1114 sensor pulses).
+#define QRD1114_STEP_LENGTH_MM  40
+
 /* ----------------------------------------------------------------
  * TYPES
  * -------------------------------------------------------------- */
@@ -120,36 +124,52 @@ typedef enum {
     COMMAND_THIS_IS_GROUND_LEVEL, // write only, has no value
     COMMAND_THIS_IS_HEIGHT_MAX,   // write only, has no value
     COMMAND_RESET_TO_DEFAULTS,    // write only, has no value
+    COMMAND_EMERGENCY_STOP,       // write only, has no value
     COMMAND_AUTO_ENABLE,          // read/write, Boolean
     COMMAND_AUTO_PERIOD_SECONDS,  // read/write, uint32_t
     COMMAND_HEIGHT_MAX_MM,        // read/write, uint32_t
     COMMAND_SPEED_MM_PER_SECOND,  // read/write, uint32_t
     COMMAND_RANDOM_ENABLE,        // read/write, Boolean
     COMMAND_STATE,                // read only, uint32_t
-    COMMAND_HEIGHT_CURRENT_MM     // read only, uint32_t
+    COMMAND_HEIGHT_CURRENT_MM,    // read only, uint32_t
+    COMMAND_NUM_OF
 } command_t;
 
 // The states the launcher can be in.
+// If you modify this enum, you will need to modify
+// g_launcher_state_name[] to match.
 typedef enum {
     LAUNCHER_STATE_NULL = 0,
+    LAUNCHER_STATE_HEIGHT_UNKNOWN,
     LAUNCHER_STATE_READY,
+    LAUNCHER_STATE_STEP_UP,
+    LAUNCHER_STATE_STEP_DOWN,
+    LAUNCHER_STATE_RUN,
     LAUNCHER_STATE_RUNNING_SKITTERING,
     LAUNCHER_STATE_RUNNING_JUMPING,
-    LAUNCHER_STATE_RUNNING_RESETTING
+    LAUNCHER_STATE_RUNNING_RESETTING,
+    LAUNCHER_STATE_HALT,
+    LAUNCHER_STATE_NUM_OF
 } launcher_state_t;
 
-// The context for the spider launcher.
+// The launcher context
+typedef struct {
+    QueueHandle_t queue;
+    TaskHandle_t task;
+    launcher_state_t state;
+    size_t step_target;
+} launcher_t;
+
+// The top-level context.
 typedef struct {
     SemaphoreHandle_t lock;
-    QueueHandle_t launcher_queue;
-    TaskHandle_t launcher_task;
     QueueHandle_t command_queue;
     TaskHandle_t command_task;
-    ble_uuid16_t spider_launcher_service_uuid;
+    ble_uuid16_t service_uuid;
     struct ble_hs_adv_fields ble_adv_fields;
     uint16_t ble_connection_handle;
     bool running;
-    launcher_state_t launcher_state;
+    launcher_t launcher;
 } context_t;
 
 // Command queue contents.
@@ -161,15 +181,15 @@ typedef struct {
 
 // Retained RAM storage.
 typedef struct {
-    uint32_t current_height_mm;
+    size_t current_step;
 } retained_ram_t;
 
 // Function prototype for a characteristic callback (which BLE calls).
 typedef int (*characteristic_cb_t) (uint16_t conn_handle, uint16_t attr_handle,
                                     struct ble_gatt_access_ctxt *ctxt, void *arg);
 
-// Function prototype for an action command handler (which ultimate does the work).
-typedef void (*command_handler_t) (context_t *context, uint32_t value);
+// Function prototype for an command handler (which ultimate does the work).
+typedef void (*command_handler_t) (launcher_t *launcher, uint32_t value);
 
 // Properties of a command we advertise as a BLE characteristic;
 // this is the basis of g_command_data_list[], which is populated way
@@ -198,12 +218,30 @@ static const struct ble_gap_adv_params g_ble_adv_params = {
 
 // Context for the whole application (fields not mentioned will be zeroed).
 static context_t g_context = {
-    .spider_launcher_service_uuid = BLE_UUID16_INIT(SERVICE_UUID),
+    .service_uuid = BLE_UUID16_INIT(SERVICE_UUID),
     .ble_connection_handle = BLE_HS_CONN_HANDLE_NONE,
     .running = true};
 
 // Retained RAM storage
 FGR_RRAM_DEFINE(retained_ram_t, retained_ram);
+
+// The names of the launcher states for debug prints;
+// entries are in the same order as launcher_state_t
+// and there must be the same number of entries
+static const char *g_launcher_state_name[] = {"NULL",
+                                              "HEIGHT_UNKNOWN",
+                                              "READY",
+                                              "STEP_UP",
+                                              "STEP_DOWN",
+                                              "RUN",
+                                              "RUNNING_SKITTERING",
+                                              "RUNNING_JUMPING",
+                                              "RUNNING_RESETTING",
+                                              "HALT"};
+
+// Do some checking
+_Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name) == LAUNCHER_STATE_NUM_OF,
+                "the number of g_launcher_state_name[] entries does not match the number of launcher states!");
 
 // THERE ARE MORE VARIABLES FURTHER DOWN
 
@@ -363,7 +401,7 @@ static int ble_gap_event_callback(struct ble_gap_event *event, void *arg);
  * STATIC FUNCTIONS: BLE
  * -------------------------------------------------------------- */
 
-// Read up to four bytes from an mbuf, returning a
+// Read up to four bytes from an mbuf, returning an
 // int32_t made from them (with no endian changes,
 // so the source must be litte-endian to work correctly).
 static uint32_t mbuf_read(const struct os_mbuf *om)
@@ -397,7 +435,7 @@ static int32_t ble_start_advertising(context_t *context)
     context->ble_adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
     // Set service UUID
-    context->ble_adv_fields.uuids16 = &context->spider_launcher_service_uuid;
+    context->ble_adv_fields.uuids16 = &context->service_uuid;
     context->ble_adv_fields.num_uuids16 = 1;
     context->ble_adv_fields.uuids16_is_complete = 1;
 
@@ -566,33 +604,194 @@ static void ble_task(void *param)
 }
 
 /* ----------------------------------------------------------------
- * STATIC FUNCTIONS: LAUNCHER
+ * STATIC FUNCTIONS: LAUNCHER (ACTUALLY DOING STUFF)
  * -------------------------------------------------------------- */
+
+// Advance state as appropriate; only allowed states should be passed
+// in via commanded_state.
+// This function _returns_ the next state, it does not change the
+// current state, it is up to the caller to do that.
+// IMPORTANT: the context should be locked before this is called.
+static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t commanded_state)
+{
+    // Use a signed value here so that negative indicates not known
+    int32_t current_step = -1;
+    retained_ram_t retained_ram;
+    if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+        current_step = (int32_t) retained_ram.current_step;
+    }
+    uint32_t height_max_mm = 0;
+    nvs_height_max_mm_get(&height_max_mm);
+
+    launcher_state_t next_state = LAUNCHER_STATE_NULL;
+    if (commanded_state == LAUNCHER_STATE_HALT) {
+        // A command to halt overrides everything else
+        next_state = commanded_state;
+    } else {
+        // Handle the current state
+        switch(launcher->state) {
+            case LAUNCHER_STATE_NULL:
+                next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
+            break;
+            case LAUNCHER_STATE_HEIGHT_UNKNOWN:
+                // If we know our current height we can transition
+                // to ready state
+                if (current_step >= 0) {
+                    next_state = LAUNCHER_STATE_READY;
+                }
+            break;
+            case LAUNCHER_STATE_READY:
+                // From ready state we can enter a commanded_state
+                switch (commanded_state) {
+                    case LAUNCHER_STATE_STEP_UP:
+                        if ((current_step + 1) * QRD1114_STEP_LENGTH_MM < (int32_t) height_max_mm) {
+                            launcher->step_target = (size_t) (current_step + 1);
+                            next_state = commanded_state;
+                        } else {
+                            ESP_LOGW(TAG, "ignoring step up, already at limit (step %d (%d mm), max %d mm (%d step(s)).",
+                                     current_step, current_step * QRD1114_STEP_LENGTH_MM,
+                                     height_max_mm, height_max_mm / QRD1114_STEP_LENGTH_MM);
+                        }
+                    break;
+                    case LAUNCHER_STATE_STEP_DOWN:
+                        if (current_step * QRD1114_STEP_LENGTH_MM > 0) {
+                            launcher->step_target = (size_t) (current_step - 1);
+                            next_state = commanded_state;
+                        } else {
+                            ESP_LOGW(TAG, "ignoring step down, at ground level already.");
+                        }
+                    break;
+                    case LAUNCHER_STATE_RUN:
+                        // Run away
+                        next_state = commanded_state;
+                    break;
+                    case LAUNCHER_STATE_NULL:
+                        // Nothing to do
+                    break;
+                    default:
+                        ESP_LOGW(TAG, "ignoring command to enter state %d from state %d.",
+                                commanded_state, launcher->state);
+                    break;
+                }
+            break;
+            case LAUNCHER_STATE_STEP_UP:
+                if (current_step >= launcher->step_target) {
+                    // Done.
+                    ESP_LOGI(TAG, "now at step %d (%d mm).", current_step,
+                            current_step * QRD1114_STEP_LENGTH_MM);
+                    next_state = LAUNCHER_STATE_READY;
+                }
+            break;
+            case LAUNCHER_STATE_STEP_DOWN:
+                if (current_step <= launcher->step_target) {
+                    // Done.
+                    ESP_LOGI(TAG, "now at step %d (%d mm).", current_step,
+                            current_step * QRD1114_STEP_LENGTH_MM);
+                    next_state = LAUNCHER_STATE_READY;
+                }
+            break;
+            case LAUNCHER_STATE_RUN:
+                // Start skittering
+                ESP_LOGI(TAG, "starting skittering.");
+            break;
+            case LAUNCHER_STATE_RUNNING_SKITTERING:
+                // TODO
+                next_state = LAUNCHER_STATE_RUNNING_JUMPING;
+            break;
+            case LAUNCHER_STATE_RUNNING_JUMPING:
+                // TODO
+                next_state = LAUNCHER_STATE_RUNNING_RESETTING;
+            break;
+            case LAUNCHER_STATE_RUNNING_RESETTING:
+                // TODO
+                next_state = LAUNCHER_STATE_READY;
+            break;
+            case LAUNCHER_STATE_HALT:
+                // TODO
+                next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
+            break;
+            default:
+                ESP_LOGE(TAG, "current state is unknown (%d)!", launcher->state);
+            break;
+        }
+    }
+
+    // Return the next state (which will be LAUNCHER_STATE_NULL if there is no change)
+    return next_state;
+}
 
 // Callback that should be run as a task to operate the launcher.
 static void launcher_cb(void *handle, void *arg)
 {
-    context_t * context = (context_t *) arg;
-    launcher_state_t commanded_state;
+    context_t *context = (context_t *) arg;
+    launcher_t *launcher = &context->launcher;
 
     (void) handle;
 
     CONTEXT_LOCK(context->lock, "launcher_cb");
 
-    while (xQueueReceive(context->launcher_queue, &commanded_state, 0) == pdTRUE) {
+    // Get a commanded state from the queue
+    launcher_state_t commanded_state = LAUNCHER_STATE_NULL;
+    while (xQueueReceive(launcher->queue, &commanded_state, 0) == pdTRUE) {
+
+        const char *name = "UNKNOWN";
+        if (commanded_state < FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name)) {
+            name = g_launcher_state_name[commanded_state];
+        }
+
+        // Check if the commanded state is allowed
         switch (commanded_state) {
             case LAUNCHER_STATE_NULL:
-                ESP_LOGI(TAG, "ignoring command to enter state NULL.");
-            break;
+            case LAUNCHER_STATE_HEIGHT_UNKNOWN:
             case LAUNCHER_STATE_READY:
             case LAUNCHER_STATE_RUNNING_SKITTERING:
             case LAUNCHER_STATE_RUNNING_JUMPING:
             case LAUNCHER_STATE_RUNNING_RESETTING:
-                // TODO
+                // These states can only be entered through internal
+                // advancement, they cannot be commanded by the user
+                ESP_LOGW(TAG, "ignoring command to enter state %s (%d).", name, commanded_state);
+                commanded_state = LAUNCHER_STATE_NULL;
+            break;
+            case LAUNCHER_STATE_STEP_UP:
+            case LAUNCHER_STATE_STEP_DOWN:
+            case LAUNCHER_STATE_RUN:
+                // Can only do these if we're ready
+                if (launcher->state == LAUNCHER_STATE_READY) {
+                    ESP_LOGI(TAG, "starting %s.", name);
+                } else {
+                    ESP_LOGW(TAG, "cannot get to state %s from state %s (only from state %s).",
+                             name, g_launcher_state_name[launcher->state],
+                             g_launcher_state_name[LAUNCHER_STATE_READY]);
+                    commanded_state = LAUNCHER_STATE_NULL;
+                }
+            break;
+            case LAUNCHER_STATE_HALT:
+                 // Always handle this
+                ESP_LOGI(TAG, "received %s.", name);
             break;
             default:
+                ESP_LOGE(TAG, "commanded to enter unknown state (%d)!", commanded_state);
+                commanded_state = LAUNCHER_STATE_NULL;
             break;
         }
+
+        if (commanded_state != LAUNCHER_STATE_NULL) {
+            // Move state on based on internal events or the new commanded_state
+            launcher_state_t next_state = advance_state(launcher, commanded_state);
+            if (next_state != LAUNCHER_STATE_NULL) {
+                ESP_LOGI(TAG, "state transition due to commanded state %s, %s -> %s.", name,
+                         g_launcher_state_name[launcher->state], g_launcher_state_name[next_state]);
+                launcher->state = next_state;
+            }
+        }
+    }
+
+    // Make sure we advance state at least once in case there are any internal changes
+    launcher_state_t next_state = advance_state(launcher, LAUNCHER_STATE_NULL);
+    if (next_state != LAUNCHER_STATE_NULL) {
+        ESP_LOGI(TAG, "internal state transition %s -> %s.",
+                 g_launcher_state_name[launcher->state], g_launcher_state_name[next_state]);
+        launcher->state = next_state;
     }
 
     CONTEXT_UNLOCK(context->lock, "launcher_cb");
@@ -603,104 +802,136 @@ static void launcher_cb(void *handle, void *arg)
  * -------------------------------------------------------------- */
 
 // Handle the "launch now" command.
-static void handler_launch_now(context_t *context, uint32_t unused)
+static void handler_launch_now(launcher_t *launcher, uint32_t unused)
 {
     (void) unused;
 
-    // TODO
+    // Queue the command to the launcher to switch to running state
+    launcher_state_t state = LAUNCHER_STATE_RUN;
+    xQueueSend(launcher->queue, &state, portMAX_DELAY);
 }
 
 // Handle the "up" command.
-static void handler_up(context_t *context, uint32_t unused)
+static void handler_up(launcher_t *launcher, uint32_t unused)
 {
     (void) unused;
 
-    // TODO
+    // Queue the command to the launcher to switch to step-up state
+    launcher_state_t state = LAUNCHER_STATE_STEP_UP;
+    xQueueSend(launcher->queue, &state, portMAX_DELAY);
 }
 
 // Handle the "down" command.
-static void handler_down(context_t *context, uint32_t unused)
+static void handler_down(launcher_t *launcher, uint32_t unused)
 {
     (void) unused;
 
-    // TODO
+    // Queue the command to the launcher to switch to step-down state
+    launcher_state_t state = LAUNCHER_STATE_STEP_DOWN;
+    xQueueSend(launcher->queue, &state, portMAX_DELAY);
 }
 
 // Handle the "this is ground level" command.
-static void handler_this_is_ground_level(context_t *context, uint32_t unused)
+static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused)
 {
     (void) unused;
 
-    // TODO
+    // Set the current step to zero
+    retained_ram_t retained_ram = {0};
+    FGR_RRAM_SET(retained_ram);
 }
 
-// Handle the "this is heigh max" command.
-static void handler_this_is_height_max(context_t *context, uint32_t unused)
+// Handle the "this is height max" command.
+static void handler_this_is_height_max(launcher_t *launcher, uint32_t unused)
 {
     (void) unused;
 
-    // TODO
+    // Get the current height
+    retained_ram_t retained_ram;
+    if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+        // Set the "height max" value in NVS
+        nvs_height_max_mm_set(retained_ram.current_step * QRD1114_STEP_LENGTH_MM);
+    }
 }
 
 // Handle the "reset to defaults" command.
-static void handler_reset_to_defaults(context_t *context, uint32_t unused)
+static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused)
 {
     (void) unused;
 
-    // TODO
+    // Write the default settings to NVS
+    nvs_auto_enable_set(DEFAULT_AUTO_ENABLE);
+    nvs_auto_period_seconds_set(DEFAULT_AUTO_PERIOD_SECONDS);
+    nvs_height_max_mm_set(DEFAULT_HEIGHT_MAX_MM);
+    nvs_speed_mm_per_second_set(DEFAULT_SPEED_MM_PER_SECOND);
+    nvs_random_enable_set(DEFAULT_RANDOM_ENABLE);
+
+    // Anything else TODO?
+}
+
+// Handle the "emergency stop" command.
+static void handler_emergency_stop(launcher_t *launcher, uint32_t unused)
+{
+    (void) unused;
+
+    // Queue the command to the launcher to halt
+    launcher_state_t state = LAUNCHER_STATE_HALT;
+    xQueueSend(launcher->queue, &state, portMAX_DELAY);
 }
 
 // Handle the "auto enable" command.
-static void handler_auto_enable(context_t *context, uint32_t enable)
+static void handler_auto_enable(launcher_t *launcher, uint32_t enable)
 {
-    // write the new setting to NVS
+    (void) launcher;
+
+    // Write the new setting to NVS
     nvs_auto_enable_set(enable ? true : false);
+
+    // Anything else TODO?
 }
 
 // Handle the "auto period" command.
-static void handler_auto_period_seconds(context_t *context, uint32_t seconds)
+static void handler_auto_period_seconds(launcher_t *launcher, uint32_t period)
 {
-    // write the new setting to NVS
-    nvs_auto_period_seconds_set(seconds);
+    (void) launcher;
+
+    // Write the new setting to NVS
+    nvs_auto_period_seconds_set(period);
+
+    // Anything else TODO?
 }
 
 // Handle the "height max" command.
-static void handler_height_max_mm(context_t *context, uint32_t mm)
+static void handler_height_max_mm(launcher_t *launcher, uint32_t height)
 {
-    // write the new setting to NVS
-    nvs_height_max_mm_set(mm);
+    (void) launcher;
+
+    // Write the new setting to NVS
+    nvs_height_max_mm_set(height);
+
+    // Anything else TODO?
 }
 
 // Handle the "speed" command.
-static void handler_speed_mm_per_second(context_t *context, uint32_t mm_per_second)
+static void handler_speed_mm_per_second(launcher_t *launcher, uint32_t speed)
 {
-    // write the new setting to NVS
-    nvs_speed_mm_per_second_set(mm_per_second);
+    (void) launcher;
+
+    // Write the new setting to NVS
+    nvs_speed_mm_per_second_set(speed);
+
+    // Anything else TODO?
 }
 
 // Handle the "random enable" command.
-static void handler_random_enable(context_t *context, uint32_t enable)
+static void handler_random_enable(launcher_t *launcher, uint32_t enable)
 {
-    // write the new setting to NVS
+    (void) launcher;
+
+    // Write the new setting to NVS
     nvs_random_enable_set(enable ? true : false);
-}
 
-// Handle the "state" command.
-static void handler_state(context_t *context, uint32_t unused)
-{
-    // Nothing to do: the value will have been returned
-    // when the command arrived
-    (void) context;
-    (void) unused;
-}
-
-// Handle the "height current" command.
-static void handler_height_current_mm(context_t *context, uint32_t unused)
-{
-    // Nothing to do: the value will have been returned
-    // when the command arrived
-    (void) context;
-    (void) unused;
+    // Anything else TODO?
 }
 
 /* ----------------------------------------------------------------
@@ -861,6 +1092,25 @@ static int characteristic_reset_to_defaults_cb(uint16_t conn_handle, uint16_t at
     return return_code;
 }
 
+// "Emergency stop" characteristic callback.
+static int characteristic_emergency_stop_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                            struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_emergency_stop_cb");
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        command_contents_t command_contents = {.command = COMMAND_EMERGENCY_STOP};
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+    }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_emergency_stop_cb");
+
+    return return_code;
+}
+
 // "Auto enable" characteristic callback.
 static int characteristic_auto_enable_cb(uint16_t conn_handle, uint16_t attr_handle,
                                          struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -1001,8 +1251,9 @@ static int characteristic_state_cb(uint16_t conn_handle, uint16_t attr_handle,
     CONTEXT_LOCK(context->lock, "characteristic_state_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        launcher_t *launcher = &context->launcher;
         command_contents_t command_contents = {.command = COMMAND_STATE,
-                                               .value = context->launcher_state};
+                                               .value = launcher->state};
         return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
 
@@ -1026,7 +1277,7 @@ static int characteristic_height_current_mm_cb(uint16_t conn_handle, uint16_t at
         retained_ram_t retained_ram;
         if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
             // Populate the current height if we have it
-            command_contents.value = retained_ram.current_height_mm;
+            command_contents.value = retained_ram.current_step * QRD1114_STEP_LENGTH_MM;
         }
         return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
@@ -1084,55 +1335,66 @@ static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE
                                                       .flags = BLE_GATT_CHR_F_WRITE,
                                                       .handler = handler_reset_to_defaults
                                                      },
-                                                     {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
+                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE7,
+                                                      .name = "EMERGENCY_STOP",
+                                                      .characteristic_cb = characteristic_emergency_stop_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .handler = handler_emergency_stop
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
+                                                      .uuid = 0xFFE8,
                                                       .name = "AUTO",
                                                       .characteristic_cb = characteristic_auto_enable_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_auto_enable
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_UINT32,
-                                                      .uuid = 0xFFE8,
+                                                      .uuid = 0xFFE9,
                                                       .name = "AUTO_PERIOD_SECONDS",
                                                       .characteristic_cb = characteristic_auto_period_seconds_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_auto_period_seconds
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_UINT32,
-                                                      .uuid = 0xFFE9,
+                                                      .uuid = 0xFFEA,
                                                       .name = "HEIGHT_MAX_MM",
                                                       .characteristic_cb = characteristic_height_max_mm_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_height_max_mm
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_UINT32,
-                                                      .uuid = 0xFFEA,
+                                                      .uuid = 0xFFEB,
                                                       .name = "SPEED_MM_PER_SECOND",
                                                       .characteristic_cb = characteristic_speed_mm_per_second_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_speed_mm_per_second
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
-                                                      .uuid = 0xFFEB,
+                                                      .uuid = 0xFFEC,
                                                       .name = "RANDOM",
                                                       .characteristic_cb = characteristic_random_enable_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_random_enable
                                                      },
                                                      {.type = COMMAND_TYPE_READ_ONLY,
-                                                      .uuid = 0xFFEC,
+                                                      .uuid = 0xFFED,
                                                       .name = "STATE",
                                                       .characteristic_cb = characteristic_state_cb,
-                                                      .flags = BLE_GATT_CHR_F_READ,
-                                                      .handler = handler_state
+                                                      .flags = BLE_GATT_CHR_F_READ
+                                                      // No handler for this one
                                                      },
                                                      {.type = COMMAND_TYPE_READ_ONLY,
-                                                      .uuid = 0xFFED,
+                                                      .uuid = 0xFFEE,
                                                       .name = "HEIGHT_CURRENT_MM",
                                                       .characteristic_cb = characteristic_height_current_mm_cb,
-                                                      .flags = BLE_GATT_CHR_F_READ,
-                                                      .handler = handler_height_current_mm
+                                                      .flags = BLE_GATT_CHR_F_READ
+                                                      // No handler for this one
                                                      }};
+
+// Do some checking
+_Static_assert (FGR_UTIL_ARRAY_LENGTH(g_command_data_list) == COMMAND_NUM_OF,
+                "the number of g_command_data_list[] entries does not match the number of commands!");
 
 /* ----------------------------------------------------------------
  * VARIABLES FOR BLE
@@ -1185,6 +1447,13 @@ static const struct ble_gatt_svc_def g_ble_spider_launcher_svcs[] = {
                 .access_cb = g_command_data_list[COMMAND_RESET_TO_DEFAULTS].characteristic_cb,
                 .arg = &g_context,
                 .flags = g_command_data_list[COMMAND_RESET_TO_DEFAULTS].flags
+            },
+            {
+                // "Emergencey stop" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_EMERGENCY_STOP].uuid),
+                .access_cb = g_command_data_list[COMMAND_EMERGENCY_STOP].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_EMERGENCY_STOP].flags
             },
             {
                 // "Auto enable" characteristic
@@ -1296,7 +1565,7 @@ static void command_cb(void *handle, void *arg)
 
             // Call the command handler
             if (handler) {
-                handler(context, value);
+                handler(&context->launcher, value);
             }
 
         } else {
@@ -1333,8 +1602,11 @@ static esp_err_t init(context_t *context)
             // There is retained RAM, which means we
             // were running, so set the initial
             // state to resetting
-            ESP_LOGI(TAG, "warm start (current height is %d mm).", retained_ram.current_height_mm);
-            context->launcher_state = LAUNCHER_STATE_RUNNING_RESETTING;
+            ESP_LOGI(TAG, "warm start (current height is %d mm (%d step(s))).",
+                     retained_ram.current_step * QRD1114_STEP_LENGTH_MM,
+                     retained_ram.current_step);
+            launcher_t *launcher = &context->launcher;
+            launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
         }
 
         // Initialise tasking, FGR style
@@ -1365,9 +1637,10 @@ static esp_err_t init(context_t *context)
         if (err == ESP_OK) {
             err = -ESP_ERR_NO_MEM;
             // RTOS stuff needed for launcher operation
-            context->launcher_queue = xQueueCreate(10, sizeof(launcher_state_t));
-            if (context->launcher_queue) {
-                err = fgr_task_create(&launcher_cb, context, "launcher", 4096, 3, &context->launcher_task);
+            launcher_t *launcher = &context->launcher;
+            launcher->queue = xQueueCreate(10, sizeof(launcher_state_t));
+            if (launcher->queue) {
+                err = fgr_task_create(&launcher_cb, context, "launcher", 4096, 3, &launcher->task);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "unable to create launcher task (%s)!", esp_err_to_name(-err));
                 }
@@ -1490,8 +1763,9 @@ void app_main(void)
     if (context->command_queue){
         vQueueDelete(context->command_queue);
     }
-    if (context->launcher_queue){
-        vQueueDelete(context->launcher_queue);
+    launcher_t *launcher = &context->launcher;
+    if (launcher->queue){
+        vQueueDelete(launcher->queue);
     }
     if (context->lock) {
         vSemaphoreDelete(context->lock);
