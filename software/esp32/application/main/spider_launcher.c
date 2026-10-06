@@ -18,8 +18,8 @@
  * @brief Implementation of a the spider launcher.  Note that
  * this application uses several of the front garden railway (FGR)
  * components (cut down and modified from the originals), for instance
- * for the debug LED, task handling, non-volatile storage and a
- * few general utilities.
+ * for the debug LED, task handling, non-volatile storage, retained
+ * RAM handling and a few general utilities.
  */
 
 #include <string.h>
@@ -49,6 +49,7 @@
 #include "fgr_debug.h"
 #include "fgr_nvs.h"
 #include "fgr_task.h"
+#include "fgr_rram.h"
 
 /* ----------------------------------------------------------------
  * COMPILE-TIME MACROS
@@ -101,40 +102,86 @@
  * TYPES
  * -------------------------------------------------------------- */
 
-// BLE characteristics for our service.
-// Note that this must start with CHARACTERISTIC_LAUNCH_NOW_UUID
-// and increase by one each time for the g_characteristic_to_name[]
-// table to work.
+// The types of command
 typedef enum {
-    CHARACTERISTIC_LAUNCH_NOW_UUID           = 0xFFE1, // (has no value)
-    CHARACTERISTIC_UP_UUID                   = 0xFFE2, // (has no value)
-    CHARACTERISTIC_DOWN_UUID                 = 0xFFE3, // (has no value)
-    CHARACTERISTIC_THIS_IS_GROUND_LEVEL_UUID = 0xFFE4, // (has no value)
-    CHARACTERISTIC_THIS_IS_HEIGHT_MAX_UUID   = 0xFFE5, // (has no value)
-    CHARACTERISTIC_RESET_TO_DEFAULTS_UUID    = 0xFFE6, // (has no value)
-    CHARACTERISTIC_AUTO_ENABLE_UUID          = 0xFFE7, // Boolean
-    CHARACTERISTIC_AUTO_PERIOD_SECONDS_UUID  = 0xFFE8, // uint32_t
-    CHARACTERISTIC_HEIGHT_MAX_MM_UUID        = 0xFFE9, // uint32_t
-    CHARACTERISTIC_SPEED_MM_PER_SECOND_UUID  = 0xFFEA, // uint32_t
-    CHARACTERISTIC_RANDOM_ENABLE_UUID        = 0xFFEB  // Boolean
-} characteristic_t;
+    COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+    COMMAND_TYPE_READ_WRITE_UINT32,
+    COMMAND_TYPE_READ_WRITE_BOOLEAN,
+    COMMAND_TYPE_READ_ONLY
+} command_type_t;
+
+// Commands to the launcher.
+// If you modify this enum, you will need to modify
+// g_command_data_list[] to match.
+typedef enum {
+    COMMAND_LAUNCH_NOW,           // write only, has no value
+    COMMAND_UP,                   // write only, has no value
+    COMMAND_DOWN,                 // write only, has no value
+    COMMAND_THIS_IS_GROUND_LEVEL, // write only, has no value
+    COMMAND_THIS_IS_HEIGHT_MAX,   // write only, has no value
+    COMMAND_RESET_TO_DEFAULTS,    // write only, has no value
+    COMMAND_AUTO_ENABLE,          // read/write, Boolean
+    COMMAND_AUTO_PERIOD_SECONDS,  // read/write, uint32_t
+    COMMAND_HEIGHT_MAX_MM,        // read/write, uint32_t
+    COMMAND_SPEED_MM_PER_SECOND,  // read/write, uint32_t
+    COMMAND_RANDOM_ENABLE,        // read/write, Boolean
+    COMMAND_STATE,                // read only, uint32_t
+    COMMAND_HEIGHT_CURRENT_MM     // read only, uint32_t
+} command_t;
+
+// The states the launcher can be in.
+typedef enum {
+    LAUNCHER_STATE_NULL = 0,
+    LAUNCHER_STATE_READY,
+    LAUNCHER_STATE_RUNNING_SKITTERING,
+    LAUNCHER_STATE_RUNNING_JUMPING,
+    LAUNCHER_STATE_RUNNING_RESETTING
+} launcher_state_t;
 
 // The context for the spider launcher.
 typedef struct {
+    SemaphoreHandle_t lock;
+    QueueHandle_t launcher_queue;
+    TaskHandle_t launcher_task;
     QueueHandle_t command_queue;
     TaskHandle_t command_task;
     ble_uuid16_t spider_launcher_service_uuid;
     struct ble_hs_adv_fields ble_adv_fields;
     uint16_t ble_connection_handle;
     bool running;
+    launcher_state_t launcher_state;
 } context_t;
 
 // Command queue contents.
 typedef struct {
-    characteristic_t characteristic;
+    command_t command;
     uint32_t value;
     bool read_not_write;
-} command_t;
+} command_contents_t;
+
+// Retained RAM storage.
+typedef struct {
+    uint32_t current_height_mm;
+} retained_ram_t;
+
+// Function prototype for a characteristic callback (which BLE calls).
+typedef int (*characteristic_cb_t) (uint16_t conn_handle, uint16_t attr_handle,
+                                    struct ble_gatt_access_ctxt *ctxt, void *arg);
+
+// Function prototype for an action command handler (which ultimate does the work).
+typedef void (*command_handler_t) (context_t *context, uint32_t value);
+
+// Properties of a command we advertise as a BLE characteristic;
+// this is the basis of g_command_data_list[], which is populated way
+// down below.
+typedef struct {
+    command_type_t type;
+    uint16_t uuid;
+    char *name;
+    characteristic_cb_t characteristic_cb;
+    ble_gatt_chr_flags flags;
+    command_handler_t handler;
+} command_data_t;
 
 /* ----------------------------------------------------------------
  * VARIABLES (THERE ARE MORE FURTHER DOWN)
@@ -149,28 +196,14 @@ static const struct ble_gap_adv_params g_ble_adv_params = {
     .itvl_min = 160,                      // Minimum advertising interval (100 ms)
     .itvl_max = 320};                     // Maximum advertising interval (200 ms)
 
-// Context for the whole application
+// Context for the whole application (fields not mentioned will be zeroed).
 static context_t g_context = {
-    .command_queue = NULL,
-    .command_task = NULL,
     .spider_launcher_service_uuid = BLE_UUID16_INIT(SERVICE_UUID),
-    .ble_adv_fields = {0},
     .ble_connection_handle = BLE_HS_CONN_HANDLE_NONE,
     .running = true};
 
-// Names for each characteristic, used for debug prints only.
-// Entries are in the same order as the characteristic enum
-static const char *g_characteristic_to_name[] = {"LAUNCH_NOW",
-                                                 "UP",
-                                                 "DOWN",
-                                                 "THIS_IS_GROUND_LEVEL",
-                                                 "THIS_IS_HEIGHT_MAX",
-                                                 "RESET_TO_DEFAULTS",
-                                                 "AUTO",
-                                                 "AUTO_PERIOD_SECONDS",
-                                                 "HEIGHT_MAX_MM",
-                                                 "SPEED_MM_PER_SECOND",
-                                                 "RANDOM"};
+// Retained RAM storage
+FGR_RRAM_DEFINE(retained_ram_t, retained_ram);
 
 // THERE ARE MORE VARIABLES FURTHER DOWN
 
@@ -352,9 +385,12 @@ static uint32_t mbuf_read(const struct os_mbuf *om)
 // Start BLE advertising
 static int32_t ble_start_advertising(context_t *context)
 {
+    int32_t err;
     ESP_LOGI(TAG, "BLE (re)starting advertising.");
 
-    // CRITICAL: Zero out the advertising fields structure before populating
+    CONTEXT_LOCK(context->lock, "ble_start_advertising");
+
+    // Zero out the advertising fields structure before populating
     memset(&context->ble_adv_fields, 0, sizeof(context->ble_adv_fields));
 
     // Set flags
@@ -370,21 +406,23 @@ static int32_t ble_start_advertising(context_t *context)
     context->ble_adv_fields.name_len = strlen(BLE_DEVICE_NAME);
     context->ble_adv_fields.name_is_complete = 1;
 
-    int32_t err = ble_gap_adv_set_fields(&context->ble_adv_fields);
+    err = ble_gap_adv_set_fields(&context->ble_adv_fields);
     if (err == 0) {
         err = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
                                 &g_ble_adv_params, ble_gap_event_callback,
                                 context);
         if (err != 0) {
             if (err == BLE_HS_EALREADY) {
-                ESP_LOGW(TAG, "Advertising already in progress");
+                ESP_LOGW(TAG, "advertising already in progress.");
             } else {
-                ESP_LOGE(TAG, "Failed to start advertising: %d", err);
+                ESP_LOGE(TAG, "failed to start advertising: %d!", err);
             }
         }
     } else {
         ESP_LOGE(TAG, "BLE failed to set advertisement fields: %d!", err);
     }
+
+    CONTEXT_UNLOCK(context->lock, "ble_start_advertising");
 
     return err;
 }
@@ -393,6 +431,8 @@ static int32_t ble_start_advertising(context_t *context)
 static int ble_gap_event_callback(struct ble_gap_event *event, void *arg)
 {
     context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "ble_gap_event_callback");
 
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
@@ -475,6 +515,8 @@ static int ble_gap_event_callback(struct ble_gap_event *event, void *arg)
         break;
     }
 
+    CONTEXT_UNLOCK(context->lock, "ble_gap_event_callback");
+
     return 0;
 }
 
@@ -502,7 +544,7 @@ static void ble_on_sync_callback(void)
             ESP_LOGI(TAG, "BLE pair with device and connect using any Bluetooth terminal app.");
         }
     } else {
-        ESP_LOGE(TAG, "BLE failed to ensure public address: %d", err);
+        ESP_LOGE(TAG, "BLE failed to ensure public address: %d!", err);
     }
 }
 
@@ -524,79 +566,160 @@ static void ble_task(void *param)
 }
 
 /* ----------------------------------------------------------------
- * STATIC FUNCTIONS: COMMAND HANDLING
+ * STATIC FUNCTIONS: LAUNCHER
  * -------------------------------------------------------------- */
 
-// Callback that should be run as a task to handle BLE commands.
-static void command_cb(void *handle, void *arg)
+// Callback that should be run as a task to operate the launcher.
+static void launcher_cb(void *handle, void *arg)
 {
+    context_t * context = (context_t *) arg;
+    launcher_state_t commanded_state;
+
     (void) handle;
 
-    context_t * context = (context_t *) arg;
-    command_t command;
+    CONTEXT_LOCK(context->lock, "launcher_cb");
 
-    if (xQueueReceive(context->command_queue, &command, pdMS_TO_TICKS(100))) {
-        const char *characteristic_name = "UNKNOWN";
-        if (command.characteristic - CHARACTERISTIC_LAUNCH_NOW_UUID < FGR_UTIL_ARRAY_LENGTH(g_characteristic_to_name)) {
-            characteristic_name = g_characteristic_to_name[command.characteristic - CHARACTERISTIC_LAUNCH_NOW_UUID];
-        }
-        switch (command.characteristic) {
-            case CHARACTERISTIC_LAUNCH_NOW_UUID:
-            case CHARACTERISTIC_UP_UUID:
-            case CHARACTERISTIC_DOWN_UUID:
-            case CHARACTERISTIC_THIS_IS_GROUND_LEVEL_UUID:
-            case CHARACTERISTIC_THIS_IS_HEIGHT_MAX_UUID:
-            case CHARACTERISTIC_RESET_TO_DEFAULTS_UUID:
-                ESP_LOGI(TAG, "BLE command (0x%04x).", command.characteristic);
-                // TODO
+    while (xQueueReceive(context->launcher_queue, &commanded_state, 0) == pdTRUE) {
+        switch (commanded_state) {
+            case LAUNCHER_STATE_NULL:
+                ESP_LOGI(TAG, "ignoring command to enter state NULL.");
             break;
-            case CHARACTERISTIC_AUTO_ENABLE_UUID:
-            case CHARACTERISTIC_RANDOM_ENABLE_UUID:
-                if (command.read_not_write) {
-                    ESP_LOGI(TAG, "BLE command %s (0x%04x), read: %s.",
-                             characteristic_name, command.characteristic,
-                             command.value ? "enabled" : "disabled");
-                } else {
-                    ESP_LOGI(TAG, "BLE command %s (0x%04x), write: %s.",
-                             characteristic_name, command.characteristic,
-                             command.value ? "enable" : "disable");
-                }
-                // TODO
-            break;
-            case CHARACTERISTIC_AUTO_PERIOD_SECONDS_UUID:
-            case CHARACTERISTIC_HEIGHT_MAX_MM_UUID:
-            case CHARACTERISTIC_SPEED_MM_PER_SECOND_UUID:
-                if (command.read_not_write) {
-                    ESP_LOGI(TAG, "BLE command %s (0x%04x), read: %d.",
-                             characteristic_name, command.characteristic,
-                             command.value);
-                } else {
-                    ESP_LOGI(TAG, "BLE command %s (0x%04x), write: %d.",
-                             characteristic_name, command.characteristic,
-                             command.value);
-                }
+            case LAUNCHER_STATE_READY:
+            case LAUNCHER_STATE_RUNNING_SKITTERING:
+            case LAUNCHER_STATE_RUNNING_JUMPING:
+            case LAUNCHER_STATE_RUNNING_RESETTING:
                 // TODO
             break;
             default:
-                ESP_LOGE(TAG, "Unknown BLE characteristic 0x%04x.", command.characteristic);
             break;
-            }
+        }
     }
+
+    CONTEXT_UNLOCK(context->lock, "launcher_cb");
 }
 
-// Send a command to the BLE command queue.
-static int queue_command(uint16_t conn_handle, uint16_t attr_handle,
-                         struct ble_gatt_access_ctxt *ctxt, void *arg,
-                         command_t *command)
+/* ----------------------------------------------------------------
+ * STATIC FUNCTIONS: COMMAND HANDLERS
+ * -------------------------------------------------------------- */
+
+// Handle the "launch now" command.
+static void handler_launch_now(context_t *context, uint32_t unused)
 {
-    context_t *context = (context_t *) arg;
+    (void) unused;
+
+    // TODO
+}
+
+// Handle the "up" command.
+static void handler_up(context_t *context, uint32_t unused)
+{
+    (void) unused;
+
+    // TODO
+}
+
+// Handle the "down" command.
+static void handler_down(context_t *context, uint32_t unused)
+{
+    (void) unused;
+
+    // TODO
+}
+
+// Handle the "this is ground level" command.
+static void handler_this_is_ground_level(context_t *context, uint32_t unused)
+{
+    (void) unused;
+
+    // TODO
+}
+
+// Handle the "this is heigh max" command.
+static void handler_this_is_height_max(context_t *context, uint32_t unused)
+{
+    (void) unused;
+
+    // TODO
+}
+
+// Handle the "reset to defaults" command.
+static void handler_reset_to_defaults(context_t *context, uint32_t unused)
+{
+    (void) unused;
+
+    // TODO
+}
+
+// Handle the "auto enable" command.
+static void handler_auto_enable(context_t *context, uint32_t enable)
+{
+    // write the new setting to NVS
+    nvs_auto_enable_set(enable ? true : false);
+}
+
+// Handle the "auto period" command.
+static void handler_auto_period_seconds(context_t *context, uint32_t seconds)
+{
+    // write the new setting to NVS
+    nvs_auto_period_seconds_set(seconds);
+}
+
+// Handle the "height max" command.
+static void handler_height_max_mm(context_t *context, uint32_t mm)
+{
+    // write the new setting to NVS
+    nvs_height_max_mm_set(mm);
+}
+
+// Handle the "speed" command.
+static void handler_speed_mm_per_second(context_t *context, uint32_t mm_per_second)
+{
+    // write the new setting to NVS
+    nvs_speed_mm_per_second_set(mm_per_second);
+}
+
+// Handle the "random enable" command.
+static void handler_random_enable(context_t *context, uint32_t enable)
+{
+    // write the new setting to NVS
+    nvs_random_enable_set(enable ? true : false);
+}
+
+// Handle the "state" command.
+static void handler_state(context_t *context, uint32_t unused)
+{
+    // Nothing to do: the value will have been returned
+    // when the command arrived
+    (void) context;
+    (void) unused;
+}
+
+// Handle the "height current" command.
+static void handler_height_current_mm(context_t *context, uint32_t unused)
+{
+    // Nothing to do: the value will have been returned
+    // when the command arrived
+    (void) context;
+    (void) unused;
+}
+
+/* ----------------------------------------------------------------
+ * STATIC FUNCTIONS: CHARACTERISTICS CALLBACKS (CALLED BY BLE)
+ * -------------------------------------------------------------- */
+
+// Send a command received over BLE to the command queue.
+// IMPORTANT: the context should be locked before this is called.
+static int queue_command(uint16_t conn_handle, uint16_t attr_handle,
+                         struct ble_gatt_access_ctxt *ctxt, context_t *context,
+                         command_contents_t *command_contents)
+{
     int return_code = BLE_ATT_ERR_UNLIKELY;
 
     switch (ctxt->op) {
         case BLE_GATT_ACCESS_OP_WRITE_CHR:
         {
             // Queue the command (non-blocking)
-            xQueueSendFromISR(context->command_queue, command, NULL);
+            xQueueSendFromISR(context->command_queue, command_contents, NULL);
 
             // Send empty success response
             os_mbuf_free_chain(ctxt->om);
@@ -607,21 +730,16 @@ static int queue_command(uint16_t conn_handle, uint16_t attr_handle,
         case BLE_GATT_ACCESS_OP_READ_CHR:
         {
             // Queue the command (non-blocking), purely for information
-            xQueueSendFromISR(context->command_queue, command, NULL);
+            xQueueSendFromISR(context->command_queue, command_contents, NULL);
 
-            // Send the reading
-            os_mbuf_append(ctxt->om, &command->value, sizeof(command->value));
+            // Send the value
+            os_mbuf_append(ctxt->om, &command_contents->value, sizeof(command_contents->value));
             return_code = 0;
         }
         break;
         default:
         {
-            const char *characteristic_name = "UNKNOWN";
-            if (command->characteristic - CHARACTERISTIC_LAUNCH_NOW_UUID < FGR_UTIL_ARRAY_LENGTH(g_characteristic_to_name)) {
-                characteristic_name = g_characteristic_to_name[command->characteristic - CHARACTERISTIC_LAUNCH_NOW_UUID];
-            }
-            ESP_LOGE(TAG, "BLE command %s (0x%04x) received unknown operation: %d (0x%02x).",
-                     characteristic_name, command->characteristic, ctxt->op, ctxt->op);
+            ESP_LOGE(TAG, "received unknown operation: %d (0x%02x)!", ctxt->op, ctxt->op);
         }
         break;
     }
@@ -629,173 +747,392 @@ static int queue_command(uint16_t conn_handle, uint16_t attr_handle,
     return return_code;
 }
 
-// "Launch now" callback.
+// "Launch now" characteristic callback.
 static int characteristic_launch_now_cb(uint16_t conn_handle, uint16_t attr_handle,
                                         struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_launch_now_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_t command = {.characteristic = CHARACTERISTIC_LAUNCH_NOW_UUID};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+        command_contents_t command_contents = {.command = COMMAND_LAUNCH_NOW};
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_launch_now_cb");
 
     return return_code;
 }
 
-// "Up" callback.
+// "Up" characteristic callback.
 static int characteristic_up_cb(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_up_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_t command = {.characteristic = CHARACTERISTIC_UP_UUID};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+        command_contents_t command_contents = {.command = COMMAND_UP};
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_up_cb");
 
     return return_code;
 }
 
-// "Down" callback.
+// "Down" characteristic callback.
 static int characteristic_down_cb(uint16_t conn_handle, uint16_t attr_handle,
                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_down_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_t command = {.characteristic = CHARACTERISTIC_DOWN_UUID};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+        command_contents_t command_contents = {.command = COMMAND_DOWN};
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_down_cb");
 
     return return_code;
 }
 
-// "This is ground level" callback.
+// "This is ground level" characteristic callback.
 static int characteristic_this_is_ground_level_cb(uint16_t conn_handle, uint16_t attr_handle,
                                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_this_is_ground_level_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_t command = {.characteristic = CHARACTERISTIC_THIS_IS_GROUND_LEVEL_UUID};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+        command_contents_t command_contents = {.command = COMMAND_THIS_IS_GROUND_LEVEL};
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_this_is_ground_level_cb");
 
     return return_code;
 }
 
-// "This is height max" callback.
+// "This is height max" characteristic callback.
 static int characteristic_this_is_height_max_cb(uint16_t conn_handle, uint16_t attr_handle,
                                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_this_is_height_max_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_t command = {.characteristic = CHARACTERISTIC_THIS_IS_HEIGHT_MAX_UUID};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+        command_contents_t command_contents = {.command = COMMAND_THIS_IS_HEIGHT_MAX};
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_this_is_height_max_cb");
 
     return return_code;
 }
 
-// "Reset to defaults" callback.
+// "Reset to defaults" characteristic callback.
 static int characteristic_reset_to_defaults_cb(uint16_t conn_handle, uint16_t attr_handle,
                                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_reset_to_defaults_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_t command = {.characteristic = CHARACTERISTIC_RESET_TO_DEFAULTS_UUID};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+        command_contents_t command_contents = {.command = COMMAND_RESET_TO_DEFAULTS};
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_reset_to_defaults_cb");
 
     return return_code;
 }
 
-// "Auto enable" callback.
+// "Auto enable" characteristic callback.
 static int characteristic_auto_enable_cb(uint16_t conn_handle, uint16_t attr_handle,
                                          struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    command_t command = {.characteristic = CHARACTERISTIC_AUTO_ENABLE_UUID,
-                         .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
-    if (command.read_not_write) {
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_auto_enable_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_AUTO_ENABLE,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
         // Read the current setting
         bool reading = false;
         nvs_auto_enable_get(&reading);
-        command.value = (uint32_t) reading;
+        command_contents.value = (uint32_t) reading;
     } else {
         // Read the value sent with the BLE command
-        command.value = mbuf_read(ctxt->om);
+        command_contents.value = mbuf_read(ctxt->om);
     }
-    return queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_auto_enable_cb");
+
+    return return_code;
 }
 
-// "Auto period" callback.
+// "Auto period" characteristic callback.
 static int characteristic_auto_period_seconds_cb(uint16_t conn_handle, uint16_t attr_handle,
                                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    command_t command = {.characteristic = CHARACTERISTIC_AUTO_PERIOD_SECONDS_UUID,
-                         .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
-    if (command.read_not_write) {
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_auto_period_seconds_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_AUTO_PERIOD_SECONDS,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
         // Read the current setting
-        nvs_auto_period_seconds_get(&command.value);
+        nvs_auto_period_seconds_get(&command_contents.value);
     } else {
         // Read the value sent with the BLE command
-        command.value = mbuf_read(ctxt->om);
+        command_contents.value = mbuf_read(ctxt->om);
     }
-    return queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_auto_period_seconds_cb");
+
+    return return_code;
 }
 
-// "Height max" callback.
+// "Height max" characteristic callback.
 static int characteristic_height_max_mm_cb(uint16_t conn_handle, uint16_t attr_handle,
                                            struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    command_t command = {.characteristic = CHARACTERISTIC_HEIGHT_MAX_MM_UUID,
-                         .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
-    if (command.read_not_write) {
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_height_max_mm_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_HEIGHT_MAX_MM,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
         // Read the current setting
-        nvs_height_max_mm_get(&command.value);
+        nvs_height_max_mm_get(&command_contents.value);
     } else {
         // Read the value sent with the BLE command
-        command.value = mbuf_read(ctxt->om);
+        command_contents.value = mbuf_read(ctxt->om);
     }
-    return queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_height_max_mm_cb");
+
+    return return_code;
 }
 
-// "Speed" callback.
+// "Speed" characteristic callback.
 static int characteristic_speed_mm_per_second_cb(uint16_t conn_handle, uint16_t attr_handle,
                                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    command_t command = {.characteristic = CHARACTERISTIC_SPEED_MM_PER_SECOND_UUID,
-                         .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
-    if (command.read_not_write) {
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_speed_mm_per_second_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_SPEED_MM_PER_SECOND,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
         // Read the current setting
-        nvs_speed_mm_per_second_get(&command.value);
+        nvs_speed_mm_per_second_get(&command_contents.value);
     } else {
         // Read the value sent with the BLE command
-        command.value = mbuf_read(ctxt->om);
+        command_contents.value = mbuf_read(ctxt->om);
     }
-    return queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_speed_mm_per_second_cb");
+
+    return return_code;
 }
 
-// "Random enable" callback.
+// "Random enable" characteristic callback.
 static int characteristic_random_enable_cb(uint16_t conn_handle, uint16_t attr_handle,
                                            struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    command_t command = {.characteristic = CHARACTERISTIC_RANDOM_ENABLE_UUID,
-                         .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
-    if (command.read_not_write) {
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_random_enable_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_RANDOM_ENABLE,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
         // Read the current setting
         bool reading = false;
         nvs_random_enable_get(&reading);
-        command.value = (uint32_t) reading;
+        command_contents.value = (uint32_t) reading;
     } else {
         // Read the value sent with the BLE command
-        command.value = mbuf_read(ctxt->om);
+        command_contents.value = mbuf_read(ctxt->om);
     }
-    return queue_command(conn_handle, attr_handle, ctxt, arg, &command);
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_random_enable_cb");
+
+    return return_code;
 }
+
+// "State" characteristic callback.
+static int characteristic_state_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_state_cb");
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        command_contents_t command_contents = {.command = COMMAND_STATE,
+                                               .value = context->launcher_state};
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+    }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_state_cb");
+
+    return return_code;
+}
+
+// "Height current" characteristic callback.
+static int characteristic_height_current_mm_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                               struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_height_current_mm_cb");
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        command_contents_t command_contents = {.command = COMMAND_HEIGHT_CURRENT_MM,
+                                               .value = (uint32_t) -1};
+        retained_ram_t retained_ram;
+        if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+            // Populate the current height if we have it
+            command_contents.value = retained_ram.current_height_mm;
+        }
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+    }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_height_current_mm_cb");
+
+    return return_code;
+}
+
+/* ----------------------------------------------------------------
+ * VARIABLES FOR COMMAND_HANDLING
+ * -------------------------------------------------------------- */
+
+// Entries are in the same order as command_t, must
+// have the same number of entries as command_t.
+static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+                                                      .uuid = 0xFFE1,
+                                                      .name = "LAUNCH_NOW",
+                                                      .characteristic_cb = characteristic_launch_now_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .handler = handler_launch_now
+                                                     },
+                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+                                                      .uuid = 0xFFE2,
+                                                      .name = "DOWN",
+                                                      .characteristic_cb = characteristic_down_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .handler = handler_down
+                                                     },
+                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+                                                      .uuid = 0xFFE3,
+                                                      .name = "UP",
+                                                      .characteristic_cb = characteristic_up_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .handler = handler_up
+                                                     },
+                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+                                                      .uuid = 0xFFE4,
+                                                      .name = "THIS_IS_GROUND_LEVEL",
+                                                      .characteristic_cb = characteristic_this_is_ground_level_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                     .handler = handler_this_is_ground_level
+                                                     },
+                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+                                                      .uuid = 0xFFE5,
+                                                      .name = "THIS_IS_HEIGHT_MAX",
+                                                      .characteristic_cb = characteristic_this_is_height_max_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .handler = handler_this_is_height_max
+                                                     },
+                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+                                                      .uuid = 0xFFE6,
+                                                      .name = "RESET_TO_DEFAULTS",
+                                                      .characteristic_cb = characteristic_reset_to_defaults_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .handler = handler_reset_to_defaults
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
+                                                      .uuid = 0xFFE7,
+                                                      .name = "AUTO",
+                                                      .characteristic_cb = characteristic_auto_enable_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_auto_enable
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_UINT32,
+                                                      .uuid = 0xFFE8,
+                                                      .name = "AUTO_PERIOD_SECONDS",
+                                                      .characteristic_cb = characteristic_auto_period_seconds_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_auto_period_seconds
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_UINT32,
+                                                      .uuid = 0xFFE9,
+                                                      .name = "HEIGHT_MAX_MM",
+                                                      .characteristic_cb = characteristic_height_max_mm_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_height_max_mm
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_UINT32,
+                                                      .uuid = 0xFFEA,
+                                                      .name = "SPEED_MM_PER_SECOND",
+                                                      .characteristic_cb = characteristic_speed_mm_per_second_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_speed_mm_per_second
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
+                                                      .uuid = 0xFFEB,
+                                                      .name = "RANDOM",
+                                                      .characteristic_cb = characteristic_random_enable_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_random_enable
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_ONLY,
+                                                      .uuid = 0xFFEC,
+                                                      .name = "STATE",
+                                                      .characteristic_cb = characteristic_state_cb,
+                                                      .flags = BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_state
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_ONLY,
+                                                      .uuid = 0xFFED,
+                                                      .name = "HEIGHT_CURRENT_MM",
+                                                      .characteristic_cb = characteristic_height_current_mm_cb,
+                                                      .flags = BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_height_current_mm
+                                                     }};
 
 /* ----------------------------------------------------------------
  * VARIABLES FOR BLE
@@ -808,87 +1145,167 @@ static const struct ble_gatt_svc_def g_ble_spider_launcher_svcs[] = {
         .uuid = BLE_UUID16_DECLARE(SERVICE_UUID),
         .characteristics = (struct ble_gatt_chr_def[]) {
             {
-                // "Launch now" characteristic (WRITE only)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_LAUNCH_NOW_UUID),
-                .access_cb = characteristic_launch_now_cb,
+                // "Launch now" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_LAUNCH_NOW].uuid),
+                .access_cb = g_command_data_list[COMMAND_LAUNCH_NOW].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE
+                .flags = g_command_data_list[COMMAND_LAUNCH_NOW].flags
             },
             {
-                // "Up" characteristic (WRITE only)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_UP_UUID),
-                .access_cb = characteristic_up_cb,
+                // "Up" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_UP].uuid),
+                .access_cb = g_command_data_list[COMMAND_UP].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE
+                .flags = g_command_data_list[COMMAND_UP].flags
             },
             {
-                // "Down" characteristic (WRITE only)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_DOWN_UUID),
-                .access_cb = characteristic_down_cb,
+                // "Down" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_DOWN].uuid),
+                .access_cb = g_command_data_list[COMMAND_DOWN].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE
+                .flags = g_command_data_list[COMMAND_DOWN].flags
             },
             {
-                // "This is ground level" characteristic (WRITE only)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_THIS_IS_GROUND_LEVEL_UUID),
-                .access_cb = characteristic_this_is_ground_level_cb,
+                // "This is ground level" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_THIS_IS_GROUND_LEVEL].uuid),
+                .access_cb = g_command_data_list[COMMAND_THIS_IS_GROUND_LEVEL].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE
+                .flags = g_command_data_list[COMMAND_THIS_IS_GROUND_LEVEL].flags
             },
             {
-                // "This is height max" characteristic (WRITE only)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_THIS_IS_HEIGHT_MAX_UUID),
-                .access_cb = characteristic_this_is_height_max_cb,
+                // "This is height max" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_THIS_IS_HEIGHT_MAX].uuid),
+                .access_cb = g_command_data_list[COMMAND_THIS_IS_HEIGHT_MAX].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE
+                .flags = g_command_data_list[COMMAND_THIS_IS_HEIGHT_MAX].flags
             },
             {
-                // "Reset to defaults" characteristic (WRITE only)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_RESET_TO_DEFAULTS_UUID),
-                .access_cb = characteristic_reset_to_defaults_cb,
+                // "Reset to defaults" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_RESET_TO_DEFAULTS].uuid),
+                .access_cb = g_command_data_list[COMMAND_RESET_TO_DEFAULTS].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE
+                .flags = g_command_data_list[COMMAND_RESET_TO_DEFAULTS].flags
             },
             {
-                // "Auto enable" characteristic (READ/WRITE)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_AUTO_ENABLE_UUID),
-                .access_cb = characteristic_auto_enable_cb,
+                // "Auto enable" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_AUTO_ENABLE].uuid),
+                .access_cb = g_command_data_list[COMMAND_AUTO_ENABLE].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ
+                .flags = g_command_data_list[COMMAND_AUTO_ENABLE].flags
             },
             {
-                // "Auto period" characteristic (READ/WRITE)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_AUTO_PERIOD_SECONDS_UUID),
-                .access_cb = characteristic_auto_period_seconds_cb,
+                // "Auto period" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_AUTO_PERIOD_SECONDS].uuid),
+                .access_cb = g_command_data_list[COMMAND_AUTO_PERIOD_SECONDS].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ
+                .flags = g_command_data_list[COMMAND_AUTO_PERIOD_SECONDS].flags
             },
             {
-                // "Height max" characteristic (READ/WRITE)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_HEIGHT_MAX_MM_UUID),
-                .access_cb = characteristic_height_max_mm_cb,
+                // "Height max" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_HEIGHT_MAX_MM].uuid),
+                .access_cb = g_command_data_list[COMMAND_HEIGHT_MAX_MM].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ
+                .flags = g_command_data_list[COMMAND_HEIGHT_MAX_MM].flags
             },
             {
-                // "Speed" characteristic (READ/WRITE)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_SPEED_MM_PER_SECOND_UUID),
-                .access_cb = characteristic_speed_mm_per_second_cb,
+                // "Speed" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_SPEED_MM_PER_SECOND].uuid),
+                .access_cb = g_command_data_list[COMMAND_SPEED_MM_PER_SECOND].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ
+                .flags = g_command_data_list[COMMAND_SPEED_MM_PER_SECOND].flags
             },
             {
-                // "Random enable" characteristic (READ/WRITE)
-                .uuid = BLE_UUID16_DECLARE(CHARACTERISTIC_RANDOM_ENABLE_UUID),
-                .access_cb = characteristic_random_enable_cb,
+                // "Random enable" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_RANDOM_ENABLE].uuid),
+                .access_cb = g_command_data_list[COMMAND_RANDOM_ENABLE].characteristic_cb,
                 .arg = &g_context,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ
+                .flags = g_command_data_list[COMMAND_RANDOM_ENABLE].flags
+            },
+            {
+                // "State" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_STATE].uuid),
+                .access_cb = g_command_data_list[COMMAND_STATE].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_STATE].flags
+            },
+            {
+                // "Height current mm" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_HEIGHT_CURRENT_MM].uuid),
+                .access_cb = g_command_data_list[COMMAND_HEIGHT_CURRENT_MM].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_HEIGHT_CURRENT_MM].flags
             },
             {0}  // Terminator
         },
     },
     {0}  // Service terminator
 };
+
+/* ----------------------------------------------------------------
+ * STATIC FUNCTIONS: COMMAND TASK
+ * -------------------------------------------------------------- */
+
+// Callback that should be run as a task to handle the command queue.
+static void command_cb(void *handle, void *arg)
+{
+    context_t * context = (context_t *) arg;
+    command_contents_t command_contents;
+
+    (void) handle;
+
+    CONTEXT_LOCK(context->lock, "command_cb");
+
+    while (xQueueReceive(context->command_queue, &command_contents, 0) == pdTRUE) {
+        command_t command = command_contents.command;
+        if (command < FGR_UTIL_ARRAY_LENGTH(g_command_data_list)) {
+
+            const char *name = g_command_data_list[command].name;
+            uint16_t uuid = g_command_data_list[command].uuid;
+            command_type_t type = g_command_data_list[command].type;
+            command_handler_t handler = g_command_data_list[command].handler;
+            uint32_t value = command_contents.value;
+
+            // Print some debug
+            switch (type) {
+                case COMMAND_TYPE_WRITE_ONLY_NO_VALUE:
+                    ESP_LOGI(TAG, "command %s (0x%04x).", name, uuid);
+                break;
+                case COMMAND_TYPE_READ_WRITE_BOOLEAN:
+                    if (command_contents.read_not_write) {
+                        ESP_LOGI(TAG, "command %s (0x%04x), read: %s.",
+                                 name, uuid, value ? "enabled" : "disabled");
+                    } else {
+                        ESP_LOGI(TAG, "command %s (0x%04x), write: %s.",
+                                 name, uuid, value ? "enable" : "disable");
+                    }
+                break;
+                case COMMAND_TYPE_READ_WRITE_UINT32:
+                    if (command_contents.read_not_write) {
+                        ESP_LOGI(TAG, "command %s (0x%04x), read: %d.", name, uuid, value);
+                    } else {
+                        ESP_LOGI(TAG, "command %s (0x%04x), write: %d.", name, uuid, value);
+                    }
+                break;
+                case COMMAND_TYPE_READ_ONLY:
+                    ESP_LOGI(TAG, "command %s (0x%04x), read: %d.", name, uuid, value);
+                break;
+                default:
+                    ESP_LOGE(TAG, "unknown command type (%d)!", type);
+                break;
+            }
+
+            // Call the command handler
+            if (handler) {
+                handler(context, value);
+            }
+
+        } else {
+            ESP_LOGE(TAG, "unknown command (%d)!", command);
+        }
+    }
+
+    CONTEXT_UNLOCK(context->lock, "command_cb");
+}
 
 /* ----------------------------------------------------------------
  * STATIC FUNCTIONS: INITIALISATION
@@ -900,102 +1317,141 @@ static esp_err_t init(context_t *context)
     // Allow us to feed the watchdog
     esp_task_wdt_add(NULL);
 
-    // Initialise tasking, FGR style
-    esp_err_t  err = fgr_task_init();
-
-    // Configure WS2812 LED operations needed for debug, FGR style
-    if (err == ESP_OK) {
-        err = fgr_ws2812_init();
-    }
-
-    // Initialize NVS, FGR style
-    if (err == ESP_OK) {
-        err = fgr_nvs_init();
-    }
-
-    // Configure the debug LED, FGR style
-    if (err == ESP_OK) {
-        err = fgr_debug_init(NULL, NULL);
-    }
-
-    // Make sure that NVS is populated (in case it is blank)
-    if (err == ESP_OK) {
-        nvs_populate();
+    // Create mutex to guard the context
+    esp_err_t err = -ESP_ERR_NO_MEM;
+    context->lock = xSemaphoreCreateMutex();
+    if (context->lock) {
+        err = ESP_OK;
     }
 
     if (err == ESP_OK) {
-        err = -ESP_ERR_NO_MEM;
-        // RTOS stuff needed for command handling
-        context->command_queue = xQueueCreate(10, sizeof(command_t));
-        if (context->command_queue) {
-            err = fgr_task_create(&command_cb, context, "command", 4096, 3, &context->command_task);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Unable to create command task (%s).", esp_err_to_name(-err));
+
+        CONTEXT_LOCK(context->lock, "init");
+
+        retained_ram_t retained_ram;
+        if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+            // There is retained RAM, which means we
+            // were running, so set the initial
+            // state to resetting
+            ESP_LOGI(TAG, "warm start (current height is %d mm).", retained_ram.current_height_mm);
+            context->launcher_state = LAUNCHER_STATE_RUNNING_RESETTING;
+        }
+
+        // Initialise tasking, FGR style
+        if (err == ESP_OK) {
+            err = fgr_task_init();
+        }
+
+        // Configure WS2812 LED operations needed for debug, FGR style
+        if (err == ESP_OK) {
+            err = fgr_ws2812_init();
+        }
+
+        // Initialize NVS, FGR style
+        if (err == ESP_OK) {
+            err = fgr_nvs_init();
+        }
+
+        // Configure the debug LED, FGR style
+        if (err == ESP_OK) {
+            err = fgr_debug_init(NULL, NULL);
+        }
+
+        // Make sure that NVS is populated (in case it is blank)
+        if (err == ESP_OK) {
+            nvs_populate();
+        }
+
+        if (err == ESP_OK) {
+            err = -ESP_ERR_NO_MEM;
+            // RTOS stuff needed for launcher operation
+            context->launcher_queue = xQueueCreate(10, sizeof(launcher_state_t));
+            if (context->launcher_queue) {
+                err = fgr_task_create(&launcher_cb, context, "launcher", 4096, 3, &context->launcher_task);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "unable to create launcher task (%s)!", esp_err_to_name(-err));
+                }
+            } else {
+                ESP_LOGE(TAG, "unable to create launcher queue!");
             }
-        } else {
-            ESP_LOGE(TAG, "Unable to create command queue.");
         }
-    }
 
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "BLE starting.");
-        // Initialize NimBLE (ESP32-S3's BLE stack)
-        err = nimble_port_init();
+        if (err == ESP_OK) {
+            err = -ESP_ERR_NO_MEM;
+            // RTOS stuff needed for command handling
+            context->command_queue = xQueueCreate(10, sizeof(command_contents_t));
+            if (context->command_queue) {
+                err = fgr_task_create(&command_cb, context, "command", 4096, 3, &context->command_task);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "unable to create command task (%s)!", esp_err_to_name(-err));
+                }
+            } else {
+                ESP_LOGE(TAG, "unable to create command queue!");
+            }
+        }
+
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "BLE starting.");
+            // Initialize NimBLE (ESP32-S3's BLE stack)
+            err = nimble_port_init();
+            if (err == 0) {
+                // Set advertising TX power to maximum (+9 dBm)
+                esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+                // Also set connection and scan power
+                esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, ESP_PWR_LVL_P9);
+                esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
+            } else {
+                ESP_LOGE(TAG, "BLE failed to initialise NimBLE: %d!", err);
+            }
+        }
+
         if (err == 0) {
-            // Set advertising TX power to maximum (+9 dBm)
-            esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
-            // Also set connection and scan power
-            esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, ESP_PWR_LVL_P9);
-            esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
-        } else {
-            ESP_LOGE(TAG, "BLE failed to initialise NimBLE: %d!", err);
-        }
-    }
+            // Initialise the NimBLE host configuration, noting that
+            // ble_hs_cfg is a magic local variable exported by host/ble_hs.h
+            ble_hs_cfg.sync_cb = ble_on_sync_callback;
+            ble_hs_cfg.reset_cb = ble_on_reset_callback;
 
-    if (err == 0) {
-        // Initialise the NimBLE host configuration, noting that
-        // ble_hs_cfg is a magic local variable exported by host/ble_hs.h
-        ble_hs_cfg.sync_cb = ble_on_sync_callback;
-        ble_hs_cfg.reset_cb = ble_on_reset_callback;
+            // Disable bonding since we don't need it
+            ble_hs_cfg.sm_bonding = 0;  // Important: Set to 0
+            ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;  // No UI
+            ble_hs_cfg.sm_mitm = 0;
+            ble_hs_cfg.sm_sc = 0;
 
-        // Disable bonding since we don't need it
-        ble_hs_cfg.sm_bonding = 0;  // Important: Set to 0
-        ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;  // No UI
-        ble_hs_cfg.sm_mitm = 0;
-        ble_hs_cfg.sm_sc = 0;
+            // Distribute BOTH Encryption and Identity keys
+            ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+            ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
-        // Distribute BOTH Encryption and Identity keys
-        ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-        ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-
-        // Initialise the mandatory Generic Access Profile service (0x1800)
-        ble_svc_gap_init();
-        // Initialise the mandatory Generic ATTribute service (0x1801)
-        ble_svc_gatt_init();
-        // [optional] add our device name
-        err = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
-        if (err != 0) {
-            ESP_LOGE(TAG, "BLE failed to initialise device name (\"%s\"): %d!",
-                     BLE_DEVICE_NAME, err);
-        }
-    }
-
-    if (err == 0) {
-        // Set up _our_ Generic ATTribute service
-        err = ble_gatts_count_cfg(g_ble_spider_launcher_svcs);
-        if (err == 0) {
-            err = ble_gatts_add_svcs(g_ble_spider_launcher_svcs);
+            // Initialise the mandatory Generic Access Profile service (0x1800)
+            ble_svc_gap_init();
+            // Initialise the mandatory Generic ATTribute service (0x1801)
+            ble_svc_gatt_init();
+            // [optional] add our device name
+            err = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
             if (err != 0) {
-                ESP_LOGE(TAG, "BLE failed to add our GATT service: %d!", err);
+                ESP_LOGE(TAG, "BLE failed to initialise device name (\"%s\"): %d!",
+                         BLE_DEVICE_NAME, err);
             }
-        } else {
-            ESP_LOGE(TAG, "BLE failed to configure GATT count: %d!", err);
         }
-    }
 
-    if (err == 0) {
-        // Start the BLE task
-        nimble_port_freertos_init(ble_task);
+        if (err == 0) {
+            // Set up _our_ Generic ATTribute service
+            err = ble_gatts_count_cfg(g_ble_spider_launcher_svcs);
+            if (err == 0) {
+                err = ble_gatts_add_svcs(g_ble_spider_launcher_svcs);
+                if (err != 0) {
+                    ESP_LOGE(TAG, "BLE failed to add our GATT service: %d!", err);
+                }
+            } else {
+                ESP_LOGE(TAG, "BLE failed to configure GATT count: %d!", err);
+            }
+        }
+
+        if (err == 0) {
+            // Start the BLE task
+            nimble_port_freertos_init(ble_task);
+        }
+
+        CONTEXT_UNLOCK(context->lock, "init");
     }
 
     return err;
@@ -1010,12 +1466,12 @@ void app_main(void)
 {
     context_t *context = &g_context;
 
-    ESP_LOGI(TAG, "Spider launcher app_main start");
+    ESP_LOGI(TAG, "app_main start");
 
     esp_err_t err = init(context);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Initialization complete.");
-        ESP_LOGI(TAG, "Waiting for BLE connections/commands.");
+        ESP_LOGI(TAG, "initialization complete.");
+        ESP_LOGI(TAG, "waiting for BLE connections/commands.");
         while (context->running) {
             // Let BLE commands do their thing
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1023,7 +1479,7 @@ void app_main(void)
         }
         esp_task_wdt_delete(NULL);
     } else {
-        ESP_LOGE(TAG, "Initialization failed, system cannot continue, will restart soonish.");
+        ESP_LOGE(TAG, "initialization failed, system cannot continue, will restart soonish.");
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
@@ -1033,6 +1489,12 @@ void app_main(void)
     fgr_task_deinit();
     if (context->command_queue){
         vQueueDelete(context->command_queue);
+    }
+    if (context->launcher_queue){
+        vQueueDelete(context->launcher_queue);
+    }
+    if (context->lock) {
+        vSemaphoreDelete(context->lock);
     }
     esp_restart();
 }
