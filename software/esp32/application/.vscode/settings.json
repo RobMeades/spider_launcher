@@ -8,5 +8,7 @@
       "--background-index",
       "--query-driver=**",
       "--compile-commands-dir=/mnt/windows/temp/spider_launcher/software/esp32/application/build"
-    ]
+    ],
+    "idf.flashType": "UART",
+    "idf.port": "/dev/ttyACM0"
 }
