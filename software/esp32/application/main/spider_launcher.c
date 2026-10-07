@@ -50,6 +50,7 @@
 #include "fgr_nvs.h"
 #include "fgr_task.h"
 #include "fgr_rram.h"
+#include "motor_brushless.h"
 
 /* ----------------------------------------------------------------
  * COMPILE-TIME MACROS
@@ -163,6 +164,7 @@ typedef struct {
 // The top-level context.
 typedef struct {
     SemaphoreHandle_t lock;
+    void *motor;
     QueueHandle_t command_queue;
     TaskHandle_t command_task;
     ble_uuid16_t service_uuid;
@@ -1577,6 +1579,23 @@ static void command_cb(void *handle, void *arg)
 }
 
 /* ----------------------------------------------------------------
+ * STATIC FUNCTIONS: MOTOR CALLBACK
+ * -------------------------------------------------------------- */
+
+// Callback called each time the QRD1114 sensor on the motor is triggered.
+static void motor_callback(void *motor, uint32_t delta_us, void *param)
+{
+    context_t *context = (context_t *) param;
+
+    (void) motor;
+
+    // TODO
+
+    (void) delta_us;
+    (void) context;
+}
+
+/* ----------------------------------------------------------------
  * STATIC FUNCTIONS: INITIALISATION
  * -------------------------------------------------------------- */
 
@@ -1609,6 +1628,21 @@ static esp_err_t init(context_t *context)
             launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
         }
 
+        // Initialise a brushless motor
+        if (err == ESP_OK) {
+            err = motor_brushless_init();
+            if (err == ESP_OK) {
+                err = -ESP_ERR_NO_MEM;
+                context->motor = motor_brushless_create(CONFIG_SPIDER_LAUNCHER_MOTOR_PWM_PIN,
+                                                        CONFIG_SPIDER_LAUNCHER_MOTOR_DIRECTION_PIN,
+                                                        CONFIG_SPIDER_LAUNCHER_QRD1114_PIN,
+                                                        8, motor_callback, context);
+                if (context->motor) {
+                    err = ESP_OK;
+                }
+            }
+        }
+
         // Initialise tasking, FGR style
         if (err == ESP_OK) {
             err = fgr_task_init();
@@ -1626,7 +1660,7 @@ static esp_err_t init(context_t *context)
 
         // Configure the debug LED, FGR style
         if (err == ESP_OK) {
-            err = fgr_debug_init(NULL, NULL);
+            err = fgr_debug_init();
         }
 
         // Make sure that NVS is populated (in case it is blank)
@@ -1767,6 +1801,7 @@ void app_main(void)
     if (launcher->queue){
         vQueueDelete(launcher->queue);
     }
+    motor_brushless_deinit();
     if (context->lock) {
         vSemaphoreDelete(context->lock);
     }

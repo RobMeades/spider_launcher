@@ -125,9 +125,7 @@ extern "C" {
  * FUNCTIONS: INITIALISE/DEINITIALISE
  * -------------------------------------------------------------- */
 
-/** Initialise debug.  If CONFIG_FGR_DEBUG_LED_SPI_NUM and the cb
- * parameter below is populated then fgr_ws2812_init() must have
- * been called first.  It is always safe to call this at any time:
+/** Initialise debug.  It is always safe to call this at any time:
  * if already initialised it will do nothing and return success.
  *
  * Note: this will create a semaphore that is never destroyed.
