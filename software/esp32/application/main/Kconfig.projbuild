@@ -28,9 +28,6 @@ menu "Application Configuration"
         bool
         default y if SPIDER_LAUNCHER_UART_NUM < 0
         default n
-        help
-            Internal symbol, do not configure directly.
-            y means "use GPIO pin mode".
 
     config SPIDER_LAUNCHER_AUDIO_PIN_0
         int "Audio pin 0"
