@@ -108,15 +108,19 @@
 // to keep within 15 characters).
 #define NVS_NAME_SPEED_MM_PER_SECOND "speed_mm_per_se"
 
-// The name for the "track num skittering" entry in non-volatile
+// The name for the "track number skittering" entry in non-volatile
 // storage (truncated to keep within 15 characters).
 #define NVS_NAME_TRACK_NUMBER_SKITTERING "track_num_skit"
 
-// The name for the "track num jumping" entry in non-volatile
+// The name for the "track number jumping" entry in non-volatile
 // storage (truncated to keep within 15 characters).
 #define NVS_NAME_TRACK_NUMBER_JUMPING "track_num_jump"
 
-// The name for the "track num resetting" entry in non-volatile
+// The name for the "track number dangling" entry in non-volatile
+// storage (truncated to keep within 15 characters).
+#define NVS_NAME_TRACK_NUMBER_DANGLING "track_num_dang"
+
+// The name for the "track number resetting" entry in non-volatile
 // storage (truncated to keep within 15 characters).
 #define NVS_NAME_TRACK_NUMBER_RESETTING "track_num_reset"
 
@@ -136,15 +140,18 @@
 #define DEFAULT_HEIGHT_MAX_MM 4000
 
 // Default value for "speed".
-#define DEFAULT_SPEED_MM_PER_SECOND 4000
+#define DEFAULT_SPEED_MM_PER_SECOND 6000
 
-// Default value for "track num skittering".
-#define DEFAULT_TRACK_NUMBER_SKITTERING 1
+// Default value for "track number skittering".
+#define DEFAULT_TRACK_NUMBER_SKITTERING 5
 
-// Default value for "track num jumping".
-#define DEFAULT_TRACK_NUMBER_JUMPING 2
+// Default value for "track number jumping".
+#define DEFAULT_TRACK_NUMBER_JUMPING 4
 
-// Default value for "track num resetting".
+// Default value for "track number dangling".
+#define DEFAULT_TRACK_NUMBER_DANGLING TRACK_NUMBER_UNUSED
+
+// Default value for "track number resetting".
 #define DEFAULT_TRACK_NUMBER_RESETTING TRACK_NUMBER_UNUSED
 
 // Default value for "random enable".
@@ -217,6 +224,7 @@ typedef enum {
     COMMAND_SPEED_MM_PER_SECOND,     // read/write, uint32_t
     COMMAND_TRACK_NUMBER_SKITTERING, // read/write, uint32_t
     COMMAND_TRACK_NUMBER_JUMPING,    // read/write, uint32_t
+    COMMAND_TRACK_NUMBER_DANGLING,   // read/write, uint32_t
     COMMAND_TRACK_NUMBER_RESETTING,  // read/write, uint32_t
     COMMAND_RANDOM_ENABLE,           // read/write, Boolean
     COMMAND_MUTE,                    // read/write, Boolean
@@ -243,6 +251,12 @@ typedef enum {
     LAUNCHER_STATE_NUMBER_OF
 } launcher_state_t;
 
+// A timer: start time and duration.
+typedef struct {
+    int64_t start_us;
+    int64_t duration_us;
+} launcher_timer_t;
+
 // The launcher context
 typedef struct {
     QueueHandle_t queue;
@@ -250,8 +264,8 @@ typedef struct {
     launcher_state_t state;
     int32_t step_target;
     bool direction_up_not_down;
-    int64_t timer_a_start_us;
-    int64_t timer_b_start_us;
+    launcher_timer_t timer_a;
+    launcher_timer_t timer_b;
     bool random_enable;
     bool temporary_stop;
     void *motor;
@@ -340,6 +354,12 @@ static const char *g_launcher_state_name[] = {"NULL",
 // Do some checking
 _Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name) == LAUNCHER_STATE_NUMBER_OF,
                 "the number of g_launcher_state_name[] entries does not match the number of launcher states!");
+
+// The durations of the known audio tracks, in order of track number
+// noting that 0 is unused
+static const uint32_t g_track_duration_ms[] = {0, 1000, 1000, 1000,
+                                               14000, 9000, 1000, 1000,
+                                               1000, 1000};
 
 // THERE ARE MORE VARIABLES FURTHER DOWN
 
@@ -454,7 +474,7 @@ static int32_t nvs_track_number_skittering_get(uint32_t *track_number)
     return err;
 }
 
-// Set the track num skittering in NVS.
+// Set the track number for skittering in NVS.
 static int32_t nvs_track_number_skittering_set(uint32_t track_number)
 {
     return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_SKITTERING, track_number);
@@ -476,10 +496,32 @@ static int32_t nvs_track_number_jumping_get(uint32_t *track_number)
     return err;
 }
 
-// Set the track num jumping in NVS.
+// Set the track number for jumping in NVS.
 static int32_t nvs_track_number_jumping_set(uint32_t track_number)
 {
     return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_JUMPING, track_number);
+}
+
+// Retrieve the dangling track number from NVS;
+// this is guaranteed to return a useful answer, even on error.
+static int32_t nvs_track_number_dangling_get(uint32_t *track_number)
+{
+    int32_t err = -ESP_ERR_INVALID_ARG;
+
+    if (track_number) {
+        err = fgr_nvs_get(NVS_NAME_TRACK_NUMBER_DANGLING, track_number);
+        if (err != ESP_OK) {
+            *track_number = DEFAULT_TRACK_NUMBER_DANGLING;
+        }
+    }
+
+    return err;
+}
+
+// Set the track number for dangling in NVS.
+static int32_t nvs_track_number_dangling_set(uint32_t track_number)
+{
+    return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_DANGLING, track_number);
 }
 
 // Retrieve the jumping track resetting from NVS;
@@ -498,7 +540,7 @@ static int32_t nvs_track_number_resetting_get(uint32_t *track_number)
     return err;
 }
 
-// Set the track num resetting in NVS.
+// Set the track number for resetting in NVS.
 static int32_t nvs_track_number_resetting_set(uint32_t track_number)
 {
     return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_RESETTING, track_number);
@@ -580,6 +622,9 @@ static void nvs_populate()
     }
     if (nvs_track_number_jumping_get(&value) != ESP_OK) {
         nvs_track_number_jumping_set(value);
+    }
+    if (nvs_track_number_dangling_get(&value) != ESP_OK) {
+        nvs_track_number_dangling_set(value);
     }
     if (nvs_track_number_resetting_get(&value) != ESP_OK) {
         nvs_track_number_resetting_set(value);
@@ -917,6 +962,21 @@ static bool can_reset_height_parameters(launcher_state_t launcher_state)
     return can_reset;
 }
 
+// Start a timer.
+static void timer_start(launcher_timer_t *timer, int64_t duration_us)
+{
+    timer->start_us = esp_timer_get_time();
+    timer->duration_us = duration_us;
+}
+
+// Check a timer for expiry.
+static bool timer_has_expired(launcher_timer_t *timer)
+{
+    int64_t now_us = esp_timer_get_time();
+    int64_t elapsed_us = now_us - timer->start_us;
+    return elapsed_us > timer->duration_us;
+}
+
 // Print out the current step and height
 static void print_step(int32_t step_current, int32_t step_ground_level)
 {
@@ -1021,8 +1081,22 @@ static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
 
-    if ((step_max == STEP_UNKNOWN) || (step_current < step_max)) {
-        // TODO: set up the skittering
+    if (step_current < step_max) {
+        // Set up the skittering audio for a duration
+        uint32_t track_number = TRACK_NUMBER_UNUSED;
+        nvs_track_number_skittering_get(&track_number);
+        int64_t duration_us = 0;
+        if (track_number < FGR_UTIL_ARRAY_LENGTH(g_track_duration_ms)) {
+            duration_us = g_track_duration_ms[track_number] * 1000;
+        }
+        timer_start(&launcher->timer_a, duration_us);
+
+        bool mute = false;
+        nvs_mute_get(&mute);
+        if (!mute) {
+            audio_play_track(track_number);
+        }
+        ESP_LOGI(TAG, "playing skittering noise for %d second(s).", duration_us / 1000000);
         next_state = LAUNCHER_STATE_RUNNING_SKITTERING;
     } else {
         ESP_LOGW(TAG, "ignoring run, already at limit (step %d (%d mm)).",
@@ -1040,23 +1114,28 @@ static launcher_state_t advance_state_skittering(launcher_t *launcher,
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
 
-    if ((step_max == STEP_UNKNOWN) || (step_current < step_max)) {
-        // TODO: run the skittering
+    // Wait for the skittering time to pass
+    if (timer_has_expired(&launcher->timer_a)) {
         // Prepare for randomness
         nvs_random_enable_get(&launcher->random_enable);
-        launcher->timer_a_start_us = esp_timer_get_time();
-        launcher->timer_b_start_us = launcher->timer_a_start_us;
+        timer_start(&launcher->timer_a, RANDOM_PAUSE_INTERVAL_MS * 1000);
+        timer_start(&launcher->timer_b, RANDOM_PAUSE_TIME_MS * 1000);
         launcher->temporary_stop = false;
-        // For now, go straight to jumping
+        // Start audio
+        uint32_t track_number = TRACK_NUMBER_UNUSED;
+        nvs_track_number_jumping_get(&track_number);
+        bool mute = false;
+        nvs_mute_get(&mute);
+        if (!mute) {
+            audio_play_track(track_number);
+        }
+        // Start jumping
         launcher->step_target = step_max;
         launcher->direction_up_not_down = true;
         ESP_LOGI(TAG, "step_current %d, step_target %d%s.", step_current, launcher->step_target,
-                 launcher->random_enable ? ", (random is enabled)" : "");
+                 launcher->random_enable ? " (random is enabled)" : "");
         motor_start(launcher->motor, launcher->direction_up_not_down, 100);
         next_state = LAUNCHER_STATE_RUNNING_JUMPING;
-    } else {
-        ESP_LOGW(TAG, "ignoring step up, already at limit (step %d (%d mm)).",
-                step_current, (step_ground_level - step_current) * QRD1114_STEP_LENGTH_MM);
     }
 
     return next_state;
@@ -1070,39 +1149,45 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
 
-    if (step_current != STEP_UNKNOWN) {
-        if (step_current < launcher->step_target) {
-            if (launcher->random_enable) {
-                // Stop randomly to make the rise jerky
-                if (!launcher->temporary_stop &&
-                    (esp_timer_get_time() - launcher->timer_b_start_us > RANDOM_PAUSE_INTERVAL_MS * 1000)) {
-                    if (esp_random() < UINT32_MAX / 2) {
-                        ESP_LOGI(TAG, "random stop for %d ms.", RANDOM_PAUSE_TIME_MS);
-                        launcher->timer_a_start_us = esp_timer_get_time();
-                        motor_stop(launcher->motor);
-                        launcher->temporary_stop = true;
-                    } else {
-                        ESP_LOGI(TAG, "won't stop randomly for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
-                        launcher->timer_b_start_us = esp_timer_get_time();
-                    }
-                }
-                if (launcher->temporary_stop &&
-                    (esp_timer_get_time() - launcher->timer_a_start_us > RANDOM_PAUSE_TIME_MS * 1000)) {
-                    ESP_LOGI(TAG, "restarting after random stop, won't stop again for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
-                    motor_start(launcher->motor, launcher->direction_up_not_down, 100);
-                    launcher->temporary_stop = false;
-                    launcher->timer_b_start_us = esp_timer_get_time();
+    if (step_current < launcher->step_target) {
+        if (launcher->random_enable) {
+            // Stop randomly to make the rise jerky
+            if (!launcher->temporary_stop && timer_has_expired(&launcher->timer_b)) {
+                if (esp_random() < UINT32_MAX / 2) {
+                    ESP_LOGI(TAG, "random stop for %d ms.", RANDOM_PAUSE_TIME_MS);
+                    timer_start(&launcher->timer_a, RANDOM_PAUSE_TIME_MS * 1000);
+                    motor_stop(launcher->motor);
+                    launcher->temporary_stop = true;
+                } else {
+                    ESP_LOGI(TAG, "won't stop randomly for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
+                    ESP_LOGI(TAG, "step_current %d, step_target %d%.", step_current, launcher->step_target);
+                    timer_start(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
                 }
             }
-        } else {
-            // Done.
-            launcher->step_target = STEP_UNKNOWN;
-            motor_stop(launcher->motor);
-            print_step(step_current, step_ground_level);
-            launcher->timer_a_start_us = esp_timer_get_time();
-            ESP_LOGI(TAG, "dangling for %d second(s).", DANGLE_TIME_SECONDS);
-            next_state = LAUNCHER_STATE_RUNNING_DANGLING;
+            if (launcher->temporary_stop && timer_has_expired(&launcher->timer_a)) {
+                ESP_LOGI(TAG, "restarting after random stop, won't stop again for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
+                ESP_LOGI(TAG, "step_current %d, step_target %d%.", step_current, launcher->step_target);
+                motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+                timer_start(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
+                launcher->temporary_stop = false;
+            }
         }
+    } else {
+        // Done.
+        launcher->step_target = STEP_UNKNOWN;
+        motor_stop(launcher->motor);
+        print_step(step_current, step_ground_level);
+        timer_start(&launcher->timer_a, DANGLE_TIME_SECONDS * 1000000);
+        // Start audio
+        uint32_t track_number = TRACK_NUMBER_UNUSED;
+        nvs_track_number_dangling_get(&track_number);
+        bool mute = false;
+        nvs_mute_get(&mute);
+        if (!mute) {
+            audio_play_track(track_number);
+        }
+        ESP_LOGI(TAG, "dangling for %d second(s).", DANGLE_TIME_SECONDS);
+        next_state = LAUNCHER_STATE_RUNNING_DANGLING;
     }
 
     return next_state;
@@ -1117,9 +1202,17 @@ static launcher_state_t advance_state_running_dangling(launcher_t *launcher,
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
 
     // Wait for the dangle time to pass
-    if (esp_timer_get_time() - launcher->timer_a_start_us > DANGLE_TIME_SECONDS * 1000000) {
+    if (timer_has_expired(&launcher->timer_a)) {
         // Done.
         ESP_LOGI(TAG, "resetting.");
+        // Start audio
+        uint32_t track_number = TRACK_NUMBER_UNUSED;
+        nvs_track_number_resetting_get(&track_number);
+        bool mute = false;
+        nvs_mute_get(&mute);
+        if (!mute) {
+            audio_play_track(track_number);
+        }
         launcher->step_target = step_ground_level;
         launcher->direction_up_not_down = false;
         ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current, launcher->step_target);
@@ -1429,10 +1522,13 @@ static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused)
 
     // Set the groud level step to the current step
     retained_ram_t retained_ram;
-    if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
-        (retained_ram.step_current != STEP_UNKNOWN)) {
-        retained_ram.step_ground_level = retained_ram.step_current;
-        FGR_RRAM_SET(retained_ram);
+    if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+        if (retained_ram.step_current != STEP_UNKNOWN) {
+            retained_ram.step_ground_level = retained_ram.step_current;
+            FGR_RRAM_SET(retained_ram);
+        } else {
+           ESP_LOGW(TAG, "cannot set ground level as current step is unknown.");
+        }
     }
 }
 
@@ -1463,6 +1559,7 @@ static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused)
     nvs_speed_mm_per_second_set(DEFAULT_SPEED_MM_PER_SECOND);
     nvs_track_number_skittering_set(DEFAULT_TRACK_NUMBER_SKITTERING);
     nvs_track_number_jumping_set(DEFAULT_TRACK_NUMBER_JUMPING);
+    nvs_track_number_dangling_set(DEFAULT_TRACK_NUMBER_DANGLING);
     nvs_track_number_resetting_set(DEFAULT_TRACK_NUMBER_RESETTING);
     nvs_random_enable_set(DEFAULT_RANDOM_ENABLE);
     nvs_mute_set(DEFAULT_MUTE);
@@ -1542,7 +1639,7 @@ static void handler_speed_mm_per_second(launcher_t *launcher, uint32_t speed)
     // Anything else TODO?
 }
 
-// Handle the "track num skittering" command.
+// Handle the "track number skittering" command.
 static void handler_track_number_skittering(launcher_t *launcher, uint32_t track_number)
 {
     (void) launcher;
@@ -1553,7 +1650,7 @@ static void handler_track_number_skittering(launcher_t *launcher, uint32_t track
     // Anything else TODO?
 }
 
-// Handle the "track num jumping" command.
+// Handle the "track number jumping" command.
 static void handler_track_number_jumping(launcher_t *launcher, uint32_t track_number)
 {
     (void) launcher;
@@ -1564,7 +1661,18 @@ static void handler_track_number_jumping(launcher_t *launcher, uint32_t track_nu
     // Anything else TODO?
 }
 
-// Handle the "track num resetting" command.
+// Handle the "track number dangling" command.
+static void handler_track_number_dangling(launcher_t *launcher, uint32_t track_number)
+{
+    (void) launcher;
+
+    // Write the new setting to NVS
+    nvs_track_number_dangling_set(track_number);
+
+    // Anything else TODO?
+}
+
+// Handle the "track number resetting" command.
 static void handler_track_number_resetting(launcher_t *launcher, uint32_t track_number)
 {
     (void) launcher;
@@ -1935,7 +2043,7 @@ static int characteristic_track_number_skittering_cb(uint16_t conn_handle, uint1
     return return_code;
 }
 
-// "Track num jumping" characteristic callback.
+// "Track number jumping" characteristic callback.
 static int characteristic_track_number_jumping_cb(uint16_t conn_handle, uint16_t attr_handle,
                                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
@@ -1960,7 +2068,32 @@ static int characteristic_track_number_jumping_cb(uint16_t conn_handle, uint16_t
     return return_code;
 }
 
-// "Track num resetting" characteristic callback.
+// "Track number dangling" characteristic callback.
+static int characteristic_track_number_dangling_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_track_number_dangling_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_JUMPING,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
+        // Read the current setting
+        nvs_track_number_dangling_get(&command_contents.value);
+    } else {
+        // Read the value sent with the BLE command
+        command_contents.value = mbuf_read(ctxt->om);
+    }
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_track_number_dangling_cb");
+
+    return return_code;
+}
+
+// "Track number resetting" characteristic callback.
 static int characteristic_track_number_resetting_cb(uint16_t conn_handle, uint16_t attr_handle,
                                                     struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
@@ -2193,34 +2326,41 @@ static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_UINT32,
                                                       .uuid = 0xFFEF,
+                                                      .name = "COMMAND_TRACK_NUMBER_DANGLING",
+                                                      .characteristic_cb = characteristic_track_number_dangling_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_track_number_dangling
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_UINT32,
+                                                      .uuid = 0xFFF0,
                                                       .name = "COMMAND_TRACK_NUMBER_RELAXING",
                                                       .characteristic_cb = characteristic_track_number_resetting_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_track_number_resetting
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
-                                                      .uuid = 0xFFF0,
+                                                      .uuid = 0xFFF1,
                                                       .name = "RANDOM",
                                                       .characteristic_cb = characteristic_random_enable_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_random_enable
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
-                                                      .uuid = 0xFFF1,
+                                                      .uuid = 0xFFF2,
                                                       .name = "MUTE",
                                                       .characteristic_cb = characteristic_mute_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_mute
                                                      },
                                                      {.type = COMMAND_TYPE_READ_ONLY,
-                                                      .uuid = 0xFFF2,
+                                                      .uuid = 0xFFF3,
                                                       .name = "STATE",
                                                       .characteristic_cb = characteristic_state_cb,
                                                       .flags = BLE_GATT_CHR_F_READ
                                                       // No handler for this one
                                                      },
                                                      {.type = COMMAND_TYPE_READ_ONLY,
-                                                      .uuid = 0xFFF3,
+                                                      .uuid = 0xFFF4,
                                                       .name = "HEIGHT_CURRENT_MM",
                                                       .characteristic_cb = characteristic_height_current_mm_cb,
                                                       .flags = BLE_GATT_CHR_F_READ
@@ -2326,21 +2466,28 @@ static const struct ble_gatt_svc_def g_ble_spider_launcher_svcs[] = {
                 .flags = g_command_data_list[COMMAND_SPEED_MM_PER_SECOND].flags
             },
             {
-                // "Track num skittering" characteristic
+                // "Track number skittering" characteristic
                 .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_TRACK_NUMBER_SKITTERING].uuid),
                 .access_cb = g_command_data_list[COMMAND_TRACK_NUMBER_SKITTERING].characteristic_cb,
                 .arg = &g_context,
                 .flags = g_command_data_list[COMMAND_TRACK_NUMBER_SKITTERING].flags
             },
             {
-                // "Track num jumping" characteristic
+                // "Track number jumping" characteristic
                 .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_TRACK_NUMBER_JUMPING].uuid),
                 .access_cb = g_command_data_list[COMMAND_TRACK_NUMBER_JUMPING].characteristic_cb,
                 .arg = &g_context,
                 .flags = g_command_data_list[COMMAND_TRACK_NUMBER_JUMPING].flags
             },
             {
-                // "Track num resetting" characteristic
+                // "Track number dangling" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_TRACK_NUMBER_DANGLING].uuid),
+                .access_cb = g_command_data_list[COMMAND_TRACK_NUMBER_DANGLING].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_TRACK_NUMBER_DANGLING].flags
+            },
+            {
+                // "Track number resetting" characteristic
                 .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_TRACK_NUMBER_RESETTING].uuid),
                 .access_cb = g_command_data_list[COMMAND_TRACK_NUMBER_RESETTING].characteristic_cb,
                 .arg = &g_context,
@@ -2703,24 +2850,15 @@ void app_main(void)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "initialization complete.");
         ESP_LOGI(TAG, "waiting for BLE connections/commands.");
-        uint32_t track_number = 1;
         bool mute = false;
         nvs_mute_get(&mute);
         if (mute) {
-            ESP_LOGI(TAG, "muted, not playing an audio.");
+            ESP_LOGI(TAG, "muted, not playing any audio.");
         }
         while (1) {
             // Let BLE commands do their thing
             vTaskDelay(pdMS_TO_TICKS(3000));
             esp_task_wdt_reset();
-            nvs_mute_get(&mute);
-            if (!mute) {
-                audio_play_track(track_number);
-                track_number++;
-                if (track_number > 4) {
-                    track_number = 1;
-                }
-            }
         }
         esp_task_wdt_delete(NULL);
     } else {
