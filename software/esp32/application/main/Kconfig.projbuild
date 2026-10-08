@@ -24,27 +24,74 @@ menu "Application Configuration"
         help
             Pin wired to the output of the QRD1114 sensor
 
+    config SPIDER_LAUNCHER_AUDIO_USE_GPIO
+        bool
+        default y if SPIDER_LAUNCHER_UART_NUM < 0
+        default n
+        help
+            Internal symbol, do not configure directly.
+            y means "use GPIO pin mode".
+
+    config SPIDER_LAUNCHER_AUDIO_PIN_0
+        int "Audio pin 0"
+        default 43
+        depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
+        help
+            GPIO pin wired to pin IO0 of the DY-HV8F audio board,
+            if all SPIDER_LAUNCHER_UART_BAUD_RATE is set.
+
+    config SPIDER_LAUNCHER_AUDIO_PIN_1
+        int "Audio pin 1"
+        default 44
+        depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
+        help
+            GPIO pin wired to pin IO1 of the DY-HV8F audio board,
+            if all SPIDER_LAUNCHER_UART_BAUD_RATE is set.
+
+    config SPIDER_LAUNCHER_AUDIO_PIN_2
+        int "Audio pin 2"
+        default 5
+        depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
+        help
+            GPIO pin wired to pin IO2 of the DY-HV8F audio board,
+            if all SPIDER_LAUNCHER_UART_BAUD_RATE is set.
+
+    config SPIDER_LAUNCHER_AUDIO_PIN_3
+        int "Audio pin 3"
+        default 4
+        depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
+        help
+            GPIO pin wired to pin IO3 of the DY-HV8F audio board,
+            if all SPIDER_LAUNCHER_UART_BAUD_RATE is set.
+
     config SPIDER_LAUNCHER_AUDIO_UART_TXD_PIN
         int "Audio TXD pin"
         default 43
+        depends on !SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help
-            UART TX pin wired to the DY-HV8F audio board
+            UART TX pin wired to the UART Rx pin of the DY-HV8F audio board,
+            ignored if SPIDER_LAUNCHER_UART_NUM is -1.
 
     config SPIDER_LAUNCHER_AUDIO_UART_RXD_PIN
         int "Audio RXD pin"
         default 44
+        depends on !SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help
-            UART RX pin wired to the DY-HV8F audio board
+            UART RX pin wired to the UART Tx pin of the DY-HV8F audio board,
+            ignored if SPIDER_LAUNCHER_UART_NUM is -1.
 
     config SPIDER_LAUNCHER_UART_NUM
         int "Audio UART number"
-        default 1
+        default -1
         help
-            UART number to use for communications with the DY-HV8F audio board
+            UART number to use for communications with the DY-HV8F audio board,
+            if -1 then the SPIDER_LAUNCHER_AUDIO_PIN_x will be used to
+            address the audio board with individual IOs instead.
 
     config SPIDER_LAUNCHER_UART_BAUD_RATE
         int "UART baud rate"
         default 9600
+        depends on !SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help
             Baud rate on the UART talking to the DY-HV8F audio board
 

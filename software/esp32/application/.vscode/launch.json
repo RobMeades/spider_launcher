@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "gdbtarget",
+            "request": "attach",
+            "name": "ESP32-S3 JTAG Debug",
+            "initCommands": [
+                "set remote hardware-watchpoint-limit 2",
+                "mon reset halt",
+                "maintenance flush register-cache",
+            ],
+            "target": {
+                "connectCommands": [
+                    "set remotetimeout 60",
+                    "-target-select extended-remote localhost:3333"
+                ]
+            }
+        }
+    ]
+}

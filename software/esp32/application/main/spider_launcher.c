@@ -20,10 +20,33 @@
  * components (cut down and modified from the originals), for instance
  * for the debug LED, task handling, non-volatile storage, retained
  * RAM handling and a few general utilities.
+ *
+ * Note: part of this setup controls a DY-HV8F audio board which has
+ * a set of DIP switches on it that aren't properly documented.  By
+ * experiment:
+ *
+ *     DIP SWITCH
+ *    1   2   3
+ * 0   L   L   L     2. IO Combination Trigger Mode [i.e. IO pins are a binary pattern]
+ * 1   H   L   L     x. As (2) but stops playing immediately when IO line is released
+ * 2   L   H   L     1. Independent IO Trigger Mode [i.e. IO pins each trigger an individual .mp3 file]
+ * 3   H   H   L        As x again
+ * 4   L   L   H     y. Nothing plays when any IO pin is shorted to ground
+ * 5   H   L   H     6. Power-on Auto-play Mode: Automatically play specified [all, one after the other, in numerical order] audio after power on
+ * 6   L   H   H        As y again
+ * 7   H   H   H        As y again
+ *
+ * One of the "y" modes should be a UART running at 9600 (input only
+ * on IO line 0) with a command format given in the data sheet but,
+ * try as I might, I could never, ever, get this to work, hence this
+ * code also supports the IO combination mode (see the KConfig file
+ * for details).
  */
 
+#include <stdint.h>
 #include <string.h>
 #include <inttypes.h>
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -33,6 +56,7 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
+#include "esp_random.h"
 #include "esp_bt.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -62,6 +86,9 @@
 // UART buffer.
 #define UART_RX_BUFFFER_SIZE 256
 
+// An unused track number (if it gets played nothing will happen).
+#define TRACK_NUMBER_UNUSED 0
+
 // The name that we appear under in Bluetooth.
 #define BLE_DEVICE_NAME "spider_launcher"
 
@@ -81,6 +108,21 @@
 // to keep within 15 characters).
 #define NVS_NAME_SPEED_MM_PER_SECOND "speed_mm_per_se"
 
+// The name for the "track num skittering" entry in non-volatile
+// storage (truncated to keep within 15 characters).
+#define NVS_NAME_TRACK_NUMBER_SKITTERING "track_num_skit"
+
+// The name for the "track num jumping" entry in non-volatile
+// storage (truncated to keep within 15 characters).
+#define NVS_NAME_TRACK_NUMBER_JUMPING "track_num_jump"
+
+// The name for the "track num resetting" entry in non-volatile
+// storage (truncated to keep within 15 characters).
+#define NVS_NAME_TRACK_NUMBER_RESETTING "track_num_reset"
+
+// The name for the "mute" entry in non-volatile storage.
+#define NVS_NAME_MUTE "mute"
+
 // The name for the "random enable" entry in non-volatile storage.
 #define NVS_NAME_RANDOM_ENABLE "random_enable"
 
@@ -94,14 +136,55 @@
 #define DEFAULT_HEIGHT_MAX_MM 4000
 
 // Default value for "speed".
-#define DEFAULT_SPEED_MM_PER_SECOND 500
+#define DEFAULT_SPEED_MM_PER_SECOND 4000
+
+// Default value for "track num skittering".
+#define DEFAULT_TRACK_NUMBER_SKITTERING 1
+
+// Default value for "track num jumping".
+#define DEFAULT_TRACK_NUMBER_JUMPING 2
+
+// Default value for "track num resetting".
+#define DEFAULT_TRACK_NUMBER_RESETTING TRACK_NUMBER_UNUSED
 
 // Default value for "random enable".
 #define DEFAULT_RANDOM_ENABLE true
 
+// Default value for "mute".
+#define DEFAULT_MUTE false
+
+// An out of range value to represent an unknown step count
+#define STEP_UNKNOWN 0x7FFFFFFF
+
 // How many mm of height is represented by one step (i.e. the distance
 // between two QRD1114 sensor pulses).
 #define QRD1114_STEP_LENGTH_MM  40
+
+// The speed in mm per second of winch movement that matches 100% PWM.
+#define SPEED_MAX_MM_PER_SECOND 8000
+
+// The minimum usable speed in mm per second.
+#define SPEED_MIN_MM_PER_SECOND 2500
+
+#if DEFAULT_SPEED_MM_PER_SECOND < SPEED_MIN_MM_PER_SECOND
+#  error "DEFAULT_SPEED_MM_PER_SECOND must be at least SPEED_MIN_MM_PER_SECOND"
+#endif
+
+// How long to dangle for at the top of the run.
+#define DANGLE_TIME_SECONDS 8
+
+// Percentage speed reduction when resetting.
+#define RESETTING_SPEED_MODIFIER_PERCENT 50
+
+// How long to pause for when doing random jerky movements, in milliseconds.
+#define RANDOM_PAUSE_TIME_MS 100
+
+// How long to leave between jerky movements in milliseconds.
+#define RANDOM_PAUSE_INTERVAL_MS 250
+
+// How long to keep the IO lines at the signalled level when running
+// the audio board in IO mode.
+#define AUDIO_IO_WAIT_TIME_MS 100
 
 /* ----------------------------------------------------------------
  * TYPES
@@ -110,6 +193,7 @@
 // The types of command
 typedef enum {
     COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+    COMMAND_TYPE_WRITE_ONLY_UINT32,
     COMMAND_TYPE_READ_WRITE_UINT32,
     COMMAND_TYPE_READ_WRITE_BOOLEAN,
     COMMAND_TYPE_READ_ONLY
@@ -119,21 +203,26 @@ typedef enum {
 // If you modify this enum, you will need to modify
 // g_command_data_list[] to match.
 typedef enum {
-    COMMAND_LAUNCH_NOW,           // write only, has no value
-    COMMAND_UP,                   // write only, has no value
-    COMMAND_DOWN,                 // write only, has no value
-    COMMAND_THIS_IS_GROUND_LEVEL, // write only, has no value
-    COMMAND_THIS_IS_HEIGHT_MAX,   // write only, has no value
-    COMMAND_RESET_TO_DEFAULTS,    // write only, has no value
-    COMMAND_EMERGENCY_STOP,       // write only, has no value
-    COMMAND_AUTO_ENABLE,          // read/write, Boolean
-    COMMAND_AUTO_PERIOD_SECONDS,  // read/write, uint32_t
-    COMMAND_HEIGHT_MAX_MM,        // read/write, uint32_t
-    COMMAND_SPEED_MM_PER_SECOND,  // read/write, uint32_t
-    COMMAND_RANDOM_ENABLE,        // read/write, Boolean
-    COMMAND_STATE,                // read only, uint32_t
-    COMMAND_HEIGHT_CURRENT_MM,    // read only, uint32_t
-    COMMAND_NUM_OF
+    COMMAND_LAUNCH_NOW,              // write only, has no value
+    COMMAND_UP,                      // write only, has no value
+    COMMAND_DOWN,                    // write only, has no value
+    COMMAND_THIS_IS_GROUND_LEVEL,    // write only, has no value
+    COMMAND_THIS_IS_HEIGHT_MAX,      // write only, has no value
+    COMMAND_RESET_TO_DEFAULTS,       // write only, has no value
+    COMMAND_EMERGENCY_STOP,          // write only, has no value
+    COMMAND_PLAY_TRACK,              // write only, uint32_t
+    COMMAND_AUTO_ENABLE,             // read/write, Boolean
+    COMMAND_AUTO_PERIOD_SECONDS,     // read/write, uint32_t
+    COMMAND_HEIGHT_MAX_MM,           // read/write, uint32_t
+    COMMAND_SPEED_MM_PER_SECOND,     // read/write, uint32_t
+    COMMAND_TRACK_NUMBER_SKITTERING, // read/write, uint32_t
+    COMMAND_TRACK_NUMBER_JUMPING,    // read/write, uint32_t
+    COMMAND_TRACK_NUMBER_RESETTING,  // read/write, uint32_t
+    COMMAND_RANDOM_ENABLE,           // read/write, Boolean
+    COMMAND_MUTE,                    // read/write, Boolean
+    COMMAND_STATE,                   // read only, uint32_t
+    COMMAND_HEIGHT_CURRENT_MM,       // read only, uint32_t
+    COMMAND_NUMBER_OF
 } command_t;
 
 // The states the launcher can be in.
@@ -148,9 +237,10 @@ typedef enum {
     LAUNCHER_STATE_RUN,
     LAUNCHER_STATE_RUNNING_SKITTERING,
     LAUNCHER_STATE_RUNNING_JUMPING,
+    LAUNCHER_STATE_RUNNING_DANGLING,
     LAUNCHER_STATE_RUNNING_RESETTING,
     LAUNCHER_STATE_HALT,
-    LAUNCHER_STATE_NUM_OF
+    LAUNCHER_STATE_NUMBER_OF
 } launcher_state_t;
 
 // The launcher context
@@ -158,19 +248,23 @@ typedef struct {
     QueueHandle_t queue;
     TaskHandle_t task;
     launcher_state_t state;
-    size_t step_target;
+    int32_t step_target;
+    bool direction_up_not_down;
+    int64_t timer_a_start_us;
+    int64_t timer_b_start_us;
+    bool random_enable;
+    bool temporary_stop;
+    void *motor;
 } launcher_t;
 
 // The top-level context.
 typedef struct {
     SemaphoreHandle_t lock;
-    void *motor;
     QueueHandle_t command_queue;
     TaskHandle_t command_task;
     ble_uuid16_t service_uuid;
     struct ble_hs_adv_fields ble_adv_fields;
     uint16_t ble_connection_handle;
-    bool running;
     launcher_t launcher;
 } context_t;
 
@@ -183,7 +277,8 @@ typedef struct {
 
 // Retained RAM storage.
 typedef struct {
-    size_t current_step;
+    int32_t step_ground_level;
+    int32_t step_current;
 } retained_ram_t;
 
 // Function prototype for a characteristic callback (which BLE calls).
@@ -222,7 +317,7 @@ static const struct ble_gap_adv_params g_ble_adv_params = {
 static context_t g_context = {
     .service_uuid = BLE_UUID16_INIT(SERVICE_UUID),
     .ble_connection_handle = BLE_HS_CONN_HANDLE_NONE,
-    .running = true};
+    .launcher.step_target = STEP_UNKNOWN};
 
 // Retained RAM storage
 FGR_RRAM_DEFINE(retained_ram_t, retained_ram);
@@ -238,11 +333,12 @@ static const char *g_launcher_state_name[] = {"NULL",
                                               "RUN",
                                               "RUNNING_SKITTERING",
                                               "RUNNING_JUMPING",
+                                              "RUNNING_DANGLING",
                                               "RUNNING_RESETTING",
                                               "HALT"};
 
 // Do some checking
-_Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name) == LAUNCHER_STATE_NUM_OF,
+_Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name) == LAUNCHER_STATE_NUMBER_OF,
                 "the number of g_launcher_state_name[] entries does not match the number of launcher states!");
 
 // THERE ARE MORE VARIABLES FURTHER DOWN
@@ -342,6 +438,72 @@ static int32_t nvs_speed_mm_per_second_set(uint32_t speed_mm_per_second)
     return fgr_nvs_set(NVS_NAME_SPEED_MM_PER_SECOND, speed_mm_per_second);
 }
 
+// Retrieve the skittering track number from NVS;
+// this is guaranteed to return a useful answer, even on error.
+static int32_t nvs_track_number_skittering_get(uint32_t *track_number)
+{
+    int32_t err = -ESP_ERR_INVALID_ARG;
+
+    if (track_number) {
+        err = fgr_nvs_get(NVS_NAME_TRACK_NUMBER_SKITTERING, track_number);
+        if (err != ESP_OK) {
+            *track_number = DEFAULT_TRACK_NUMBER_SKITTERING;
+        }
+    }
+
+    return err;
+}
+
+// Set the track num skittering in NVS.
+static int32_t nvs_track_number_skittering_set(uint32_t track_number)
+{
+    return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_SKITTERING, track_number);
+}
+
+// Retrieve the jumping track number from NVS;
+// this is guaranteed to return a useful answer, even on error.
+static int32_t nvs_track_number_jumping_get(uint32_t *track_number)
+{
+    int32_t err = -ESP_ERR_INVALID_ARG;
+
+    if (track_number) {
+        err = fgr_nvs_get(NVS_NAME_TRACK_NUMBER_JUMPING, track_number);
+        if (err != ESP_OK) {
+            *track_number = DEFAULT_TRACK_NUMBER_JUMPING;
+        }
+    }
+
+    return err;
+}
+
+// Set the track num jumping in NVS.
+static int32_t nvs_track_number_jumping_set(uint32_t track_number)
+{
+    return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_JUMPING, track_number);
+}
+
+// Retrieve the jumping track resetting from NVS;
+// this is guaranteed to return a useful answer, even on error.
+static int32_t nvs_track_number_resetting_get(uint32_t *track_number)
+{
+    int32_t err = -ESP_ERR_INVALID_ARG;
+
+    if (track_number) {
+        err = fgr_nvs_get(NVS_NAME_TRACK_NUMBER_RESETTING, track_number);
+        if (err != ESP_OK) {
+            *track_number = DEFAULT_TRACK_NUMBER_RESETTING;
+        }
+    }
+
+    return err;
+}
+
+// Set the track num resetting in NVS.
+static int32_t nvs_track_number_resetting_set(uint32_t track_number)
+{
+    return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_RESETTING, track_number);
+}
+
 // Retrieve whether random is enabled or not from NVS;
 // this is guaranteed to return a useful answer, even on error.
 static int32_t nvs_random_enable_get(bool *enable)
@@ -367,6 +529,31 @@ static int32_t nvs_random_enable_set(bool enable)
     return fgr_nvs_set(NVS_NAME_RANDOM_ENABLE, enable);
 }
 
+// Retrieve whether audio muting is enabled or not from NVS;
+// this is guaranteed to return a useful answer, even on error.
+static int32_t nvs_mute_get(bool *enable)
+{
+    int32_t err = -ESP_ERR_INVALID_ARG;
+    uint32_t value = 0;
+
+    if (enable) {
+        err = fgr_nvs_get(NVS_NAME_MUTE, &value);
+        if (err == ESP_OK) {
+            *enable = (value != 0);
+        } else {
+            *enable = DEFAULT_MUTE;
+        }
+    }
+
+    return err;
+}
+
+// Set whether audio muting is enabled or not in NVS.
+static int32_t nvs_mute_set(bool enable)
+{
+    return fgr_nvs_set(NVS_NAME_MUTE, enable);
+}
+
 // Populate NVS with defaults if required.
 static void nvs_populate()
 {
@@ -388,9 +575,115 @@ static void nvs_populate()
     if (nvs_speed_mm_per_second_get(&value) != ESP_OK) {
         nvs_speed_mm_per_second_set(value);
     }
+    if (nvs_track_number_skittering_get(&value) != ESP_OK) {
+        nvs_track_number_skittering_set(value);
+    }
+    if (nvs_track_number_jumping_get(&value) != ESP_OK) {
+        nvs_track_number_jumping_set(value);
+    }
+    if (nvs_track_number_resetting_get(&value) != ESP_OK) {
+        nvs_track_number_resetting_set(value);
+    }
     if (nvs_random_enable_get(&enable) != ESP_OK) {
         nvs_random_enable_set(enable);
     }
+    if (nvs_mute_get(&enable) != ESP_OK) {
+        nvs_mute_set(enable);
+    }
+}
+
+/* ----------------------------------------------------------------
+ * STATIC FUNCTIONS: DY-HV8F AUDIO BOARD RELATED
+ * -------------------------------------------------------------- */
+
+#if !defined(CONFIG_SPIDER_LAUNCHER_UART_NUM) || (CONFIG_SPIDER_LAUNCHER_UART_NUM < 0)
+static uint8_t audio_play_set_pin(uint32_t track_number, int32_t bit_mask, int32_t pin, bool highNotLow)
+{
+    uint8_t resulting_bit_pattern = track_number & bit_mask;
+
+    if (!highNotLow) {
+        resulting_bit_pattern = ~resulting_bit_pattern;
+    }
+    gpio_set_level(pin, track_number & bit_mask ? highNotLow : !highNotLow);
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+
+    return resulting_bit_pattern;
+}
+#endif
+
+// Play the given audio track.
+static void audio_play_track(uint32_t track_number)
+{
+#if defined(CONFIG_SPIDER_LAUNCHER_UART_NUM) && (CONFIG_SPIDER_LAUNCHER_UART_NUM >= 0)
+    // Command format is:
+    //
+    // 0xAA 0x04 0x03 high_byte low_byte checksum
+    //
+    // ...where checksum = 0xAA + data length + command byte + parameter byte
+    //
+    // For example, to play track 1:
+    //
+    // 0xAA 0x04 0x03 0x00 0x01 checksum
+
+    uint8_t buffer[] = {0xaa, 0x04, 0x03,  (track_number >> 8) & 0xFF, track_number & 0xFF, 0};
+    //uint8_t buffer[] = {0xaa, 0x07, 0x02,  (track_number >> 8) & 0xFF, track_number & 0xFF, 0};
+    //uint8_t buffer[] = {0xaa, 0x02, 0x00, 0};
+
+    uint8_t checksum = 0;
+    for (size_t x = 0; x < FGR_UTIL_ARRAY_LENGTH(buffer) - 1; x++) {
+        checksum += buffer[x];
+    }
+    buffer[FGR_UTIL_ARRAY_LENGTH(buffer) - 1] = checksum;
+
+    int32_t x = uart_write_bytes(CONFIG_SPIDER_LAUNCHER_UART_NUM, buffer, sizeof(buffer));
+    ESP_LOGI("DEBUG", "To play audio track %d sent %d byte(s) {0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x} on UART %d, TXD on pin %d.",
+             track_number, x, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], CONFIG_SPIDER_LAUNCHER_UART_NUM,
+             CONFIG_SPIDER_LAUNCHER_AUDIO_UART_TXD_PIN);
+
+    // Wait for transmission to complete
+    uart_wait_tx_done(CONFIG_SPIDER_LAUNCHER_UART_NUM, pdMS_TO_TICKS(100));
+#else
+    // In GPIO control mode: each GPIO line is one bit in an up-to-four-bit
+    // binary word which is set low to indicate a 1, high to indicate a 0.
+    // For this to work all three DIP switches on a DY-HV8F board should be
+    // in the low position
+    uint8_t bit_pattern = 0xFF;
+    size_t bit_count = 0;
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0 >= 0)
+    bit_pattern &= audio_play_set_pin(track_number, 0x01, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0, false);
+    bit_count++;
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1 >= 0)
+    bit_pattern &= audio_play_set_pin(track_number, 0x02, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1, false);
+    bit_count++;
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2 >= 0)
+    bit_pattern &= audio_play_set_pin(track_number, 0x04, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2, false);
+    bit_count++;
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3 >= 0)
+    bit_pattern &= audio_play_set_pin(track_number, 0x08, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3, false);
+    bit_count++;
+#  endif
+
+    ESP_LOGI(TAG, "To play audio track %d, setting IO lines (%d line(s)) to 0x%1x for %d ms.",
+             track_number, bit_count, bit_pattern, AUDIO_IO_WAIT_TIME_MS);
+
+    vTaskDelay(pdMS_TO_TICKS(AUDIO_IO_WAIT_TIME_MS));
+
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0 >= 0)
+    audio_play_set_pin(0xF, 0x01, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0, true);
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1 >= 0)
+    audio_play_set_pin(0xF, 0x02, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1, true);
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2 >= 0)
+    audio_play_set_pin(0xF, 0x04, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2, true);
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3 >= 0)
+    audio_play_set_pin(0xF, 0x08, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3, true);
+#  endif
+#endif
 }
 
 /* ----------------------------------------------------------------
@@ -609,6 +902,253 @@ static void ble_task(void *param)
  * STATIC FUNCTIONS: LAUNCHER (ACTUALLY DOING STUFF)
  * -------------------------------------------------------------- */
 
+// Determine whether the launcher is in a state where the height
+// related parameters can be reset.
+static bool can_reset_height_parameters(launcher_state_t launcher_state)
+{
+    bool can_reset = false;
+
+    if ((launcher_state == LAUNCHER_STATE_NULL) ||
+        (launcher_state == LAUNCHER_STATE_HEIGHT_UNKNOWN) ||
+        (launcher_state == LAUNCHER_STATE_READY)) {
+        can_reset = true;
+    }
+
+    return can_reset;
+}
+
+// Print out the current step and height
+static void print_step(int32_t step_current, int32_t step_ground_level)
+{
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), " (%d mm)", (int) (step_current - step_ground_level) * QRD1114_STEP_LENGTH_MM);
+    ESP_LOGI(TAG, "step %d%s.", step_current,
+                step_ground_level != STEP_UNKNOWN ? buffer : "");
+}
+
+// Start the motor speed in the given direction.
+static void motor_start(void *motor, bool direction_up_not_down,
+                        uint32_t speed_modifier_percent)
+{
+    uint32_t abs_speed_mm_per_second;
+    int32_t err = nvs_speed_mm_per_second_get(&abs_speed_mm_per_second);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "unable to read speed from NVS (%s), using default (%d mm/s).",
+                  esp_err_to_name(-err), abs_speed_mm_per_second);
+    }
+
+    int32_t speed_mm_per_second = (int32_t) abs_speed_mm_per_second * speed_modifier_percent / 100;
+    if (!direction_up_not_down) {
+        speed_mm_per_second = -speed_mm_per_second;
+    }
+
+    int32_t pwm = 100 * speed_mm_per_second / SPEED_MAX_MM_PER_SECOND;
+    err = motor_brushless_set_speed(motor, pwm);
+    if (err == ESP_OK) {
+         ESP_LOGI(TAG, "speed set to %d mm/s (pwm %d%%).", speed_mm_per_second, pwm);
+    } else {
+         ESP_LOGE(TAG, "unable to set speed to %d mm/s (pwm %d%%) (%s).",
+                  speed_mm_per_second, pwm, esp_err_to_name(-err));
+    }
+}
+
+// Stop the motor.
+static void motor_stop(void *motor)
+{
+    int32_t err = motor_brushless_set_speed(motor, 0);
+    if (err == ESP_OK) {
+         ESP_LOGI(TAG, "motor stopped.");
+    } else {
+         ESP_LOGE(TAG, "unable to stop motor.");
+    }
+}
+
+// Advance state based on commanded state LAUNCHER_STATE_STEP_UP.
+static launcher_state_t advance_state_commanded_step_up(launcher_t *launcher,
+                                                        int32_t step_current,
+                                                        int32_t step_max,
+                                                        int32_t step_ground_level)
+{
+    launcher_state_t next_state = LAUNCHER_STATE_NULL;
+
+    if (step_current == STEP_UNKNOWN) {
+        // Got to have some sort of reference
+        step_current = 0;
+    }
+    if ((step_max == STEP_UNKNOWN) || (step_current + 1 < step_max)) {
+        launcher->step_target = step_current + 1;
+        launcher->direction_up_not_down = true;
+        ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current, launcher->step_target);
+        motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+        next_state = LAUNCHER_STATE_STEP_UP;
+    } else {
+        ESP_LOGW(TAG, "ignoring step up, already at limit (step %d (%d mm)).",
+                 step_current, (step_ground_level - step_current) * QRD1114_STEP_LENGTH_MM);
+    }
+
+    return next_state;
+}
+
+// Advance state based on commanded state LAUNCHER_STATE_STEP_DOWN.
+static launcher_state_t advance_state_commanded_step_down(launcher_t *launcher,
+                                                          int32_t step_current,
+                                                          int32_t step_ground_level)
+{
+    launcher_state_t next_state = LAUNCHER_STATE_NULL;
+
+    if (step_current == STEP_UNKNOWN) {
+        // Got to have some sort of reference
+        step_current = 0;
+    }
+    if ((step_ground_level == STEP_UNKNOWN) || (step_current > step_ground_level)) {
+        launcher->step_target = step_current - 1;
+        launcher->direction_up_not_down = false;
+        ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current, launcher->step_target);
+        motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+        next_state = LAUNCHER_STATE_STEP_DOWN;
+    } else {
+        ESP_LOGW(TAG, "ignoring step down, at ground level already (%d).", step_ground_level);
+    }
+
+    return next_state;
+}
+
+// Advance state based on commanded state LAUNCHER_STATE_RUN.
+static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
+                                                    int32_t step_current,
+                                                    int32_t step_max,
+                                                    int32_t step_ground_level)
+{
+    launcher_state_t next_state = LAUNCHER_STATE_NULL;
+
+    if ((step_max == STEP_UNKNOWN) || (step_current < step_max)) {
+        // TODO: set up the skittering
+        next_state = LAUNCHER_STATE_RUNNING_SKITTERING;
+    } else {
+        ESP_LOGW(TAG, "ignoring run, already at limit (step %d (%d mm)).",
+                 step_current, (step_ground_level - step_current) * QRD1114_STEP_LENGTH_MM);
+    }
+
+    return next_state;
+}
+
+// Advance state based on state LAUNCHER_STATE_SKITTERING.
+static launcher_state_t advance_state_skittering(launcher_t *launcher,
+                                                 int32_t step_current,
+                                                 int32_t step_max,
+                                                 int32_t step_ground_level)
+{
+    launcher_state_t next_state = LAUNCHER_STATE_NULL;
+
+    if ((step_max == STEP_UNKNOWN) || (step_current < step_max)) {
+        // TODO: run the skittering
+        // Prepare for randomness
+        nvs_random_enable_get(&launcher->random_enable);
+        launcher->timer_a_start_us = esp_timer_get_time();
+        launcher->timer_b_start_us = launcher->timer_a_start_us;
+        launcher->temporary_stop = false;
+        // For now, go straight to jumping
+        launcher->step_target = step_max;
+        launcher->direction_up_not_down = true;
+        ESP_LOGI(TAG, "step_current %d, step_target %d%s.", step_current, launcher->step_target,
+                 launcher->random_enable ? ", (random is enabled)" : "");
+        motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+        next_state = LAUNCHER_STATE_RUNNING_JUMPING;
+    } else {
+        ESP_LOGW(TAG, "ignoring step up, already at limit (step %d (%d mm)).",
+                step_current, (step_ground_level - step_current) * QRD1114_STEP_LENGTH_MM);
+    }
+
+    return next_state;
+}
+
+// Advance state based on state LAUNCHER_STATE_RUNNING_JUMPING.
+static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
+                                                      int32_t step_current,
+                                                      int32_t step_max,
+                                                      int32_t step_ground_level)
+{
+    launcher_state_t next_state = LAUNCHER_STATE_NULL;
+
+    if (step_current != STEP_UNKNOWN) {
+        if (step_current < launcher->step_target) {
+            if (launcher->random_enable) {
+                // Stop randomly to make the rise jerky
+                if (!launcher->temporary_stop &&
+                    (esp_timer_get_time() - launcher->timer_b_start_us > RANDOM_PAUSE_INTERVAL_MS * 1000)) {
+                    if (esp_random() < UINT32_MAX / 2) {
+                        ESP_LOGI(TAG, "random stop for %d ms.", RANDOM_PAUSE_TIME_MS);
+                        launcher->timer_a_start_us = esp_timer_get_time();
+                        motor_stop(launcher->motor);
+                        launcher->temporary_stop = true;
+                    } else {
+                        ESP_LOGI(TAG, "won't stop randomly for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
+                        launcher->timer_b_start_us = esp_timer_get_time();
+                    }
+                }
+                if (launcher->temporary_stop &&
+                    (esp_timer_get_time() - launcher->timer_a_start_us > RANDOM_PAUSE_TIME_MS * 1000)) {
+                    ESP_LOGI(TAG, "restarting after random stop, won't stop again for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
+                    motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+                    launcher->temporary_stop = false;
+                    launcher->timer_b_start_us = esp_timer_get_time();
+                }
+            }
+        } else {
+            // Done.
+            launcher->step_target = STEP_UNKNOWN;
+            motor_stop(launcher->motor);
+            print_step(step_current, step_ground_level);
+            launcher->timer_a_start_us = esp_timer_get_time();
+            ESP_LOGI(TAG, "dangling for %d second(s).", DANGLE_TIME_SECONDS);
+            next_state = LAUNCHER_STATE_RUNNING_DANGLING;
+        }
+    }
+
+    return next_state;
+}
+
+// Advance state based on state LAUNCHER_STATE_RUNNING_DANGLING.
+static launcher_state_t advance_state_running_dangling(launcher_t *launcher,
+                                                       int32_t step_current,
+                                                       int32_t step_max,
+                                                       int32_t step_ground_level)
+{
+    launcher_state_t next_state = LAUNCHER_STATE_NULL;
+
+    // Wait for the dangle time to pass
+    if (esp_timer_get_time() - launcher->timer_a_start_us > DANGLE_TIME_SECONDS * 1000000) {
+        // Done.
+        ESP_LOGI(TAG, "resetting.");
+        launcher->step_target = step_ground_level;
+        launcher->direction_up_not_down = false;
+        ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current, launcher->step_target);
+        motor_start(launcher->motor, launcher->direction_up_not_down, RESETTING_SPEED_MODIFIER_PERCENT);
+        next_state = LAUNCHER_STATE_RUNNING_RESETTING;
+    }
+
+    return next_state;
+}
+
+// Advance state based on state LAUNCHER_STATE_RUNNING_RESETTING.
+static launcher_state_t advance_state_running_resetting(launcher_t *launcher,
+                                                        int32_t step_current,
+                                                        int32_t step_max,
+                                                        int32_t step_ground_level)
+{
+    launcher_state_t next_state = LAUNCHER_STATE_NULL;
+
+    if ((step_current != STEP_UNKNOWN) && (step_current <= launcher->step_target)) {
+        // Done.
+        launcher->step_target = STEP_UNKNOWN;
+        motor_stop(launcher->motor);
+        print_step(step_current, step_ground_level);
+        next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
+    }
+
+    return next_state;
+}
+
 // Advance state as appropriate; only allowed states should be passed
 // in via commanded_state.
 // This function _returns_ the next state, it does not change the
@@ -617,17 +1157,24 @@ static void ble_task(void *param)
 static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t commanded_state)
 {
     // Use a signed value here so that negative indicates not known
-    int32_t current_step = -1;
+    int32_t step_current = STEP_UNKNOWN;
+    int32_t step_ground_level = STEP_UNKNOWN;
     retained_ram_t retained_ram;
     if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
-        current_step = (int32_t) retained_ram.current_step;
+        step_current = (int32_t) retained_ram.step_current;
+        step_ground_level = (int32_t) retained_ram.step_ground_level;
     }
-    uint32_t height_max_mm = 0;
-    nvs_height_max_mm_get(&height_max_mm);
+    int32_t step_max = STEP_UNKNOWN;
+    if (step_ground_level != STEP_UNKNOWN) {
+        uint32_t height_max_mm = 0;
+        nvs_height_max_mm_get(&height_max_mm);
+        step_max = step_ground_level + ((int32_t) height_max_mm / QRD1114_STEP_LENGTH_MM);
+    }
 
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     if (commanded_state == LAUNCHER_STATE_HALT) {
         // A command to halt overrides everything else
+        motor_stop(launcher->motor);
         next_state = commanded_state;
     } else {
         // Handle the current state
@@ -636,32 +1183,47 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                 next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
             break;
             case LAUNCHER_STATE_HEIGHT_UNKNOWN:
-                // If we know our current height we can transition
+                // If we know where the ground is we can transition
                 // to ready state
-                if (current_step >= 0) {
+                if (step_ground_level != STEP_UNKNOWN) {
                     next_state = LAUNCHER_STATE_READY;
+                } else {
+                    // From height unknown state we can only do steps
+                    switch (commanded_state) {
+                        case LAUNCHER_STATE_STEP_UP:
+                            next_state = advance_state_commanded_step_up(launcher,
+                                                                         step_current,
+                                                                         STEP_UNKNOWN,
+                                                                         step_ground_level);
+                        break;
+                        case LAUNCHER_STATE_STEP_DOWN:
+                            next_state = advance_state_commanded_step_down(launcher,
+                                                                           step_current,
+                                                                           STEP_UNKNOWN);
+                        break;
+                        case LAUNCHER_STATE_NULL:
+                            // Nothing to do
+                        break;
+                        default:
+                            ESP_LOGW(TAG, "ignoring command to enter state %d from state %d.",
+                                     commanded_state, launcher->state);
+                        break;
+                    }
                 }
             break;
             case LAUNCHER_STATE_READY:
-                // From ready state we can enter a commanded_state
+                // From ready state we can step and run
                 switch (commanded_state) {
                     case LAUNCHER_STATE_STEP_UP:
-                        if ((current_step + 1) * QRD1114_STEP_LENGTH_MM < (int32_t) height_max_mm) {
-                            launcher->step_target = (size_t) (current_step + 1);
-                            next_state = commanded_state;
-                        } else {
-                            ESP_LOGW(TAG, "ignoring step up, already at limit (step %d (%d mm), max %d mm (%d step(s)).",
-                                     current_step, current_step * QRD1114_STEP_LENGTH_MM,
-                                     height_max_mm, height_max_mm / QRD1114_STEP_LENGTH_MM);
-                        }
+                        next_state = advance_state_commanded_step_up(launcher,
+                                                                     step_current,
+                                                                     step_max,
+                                                                     step_ground_level);
                     break;
                     case LAUNCHER_STATE_STEP_DOWN:
-                        if (current_step * QRD1114_STEP_LENGTH_MM > 0) {
-                            launcher->step_target = (size_t) (current_step - 1);
-                            next_state = commanded_state;
-                        } else {
-                            ESP_LOGW(TAG, "ignoring step down, at ground level already.");
-                        }
+                        next_state = advance_state_commanded_step_down(launcher,
+                                                                       step_current,
+                                                                       step_ground_level);
                     break;
                     case LAUNCHER_STATE_RUN:
                         // Run away
@@ -672,44 +1234,59 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                     break;
                     default:
                         ESP_LOGW(TAG, "ignoring command to enter state %d from state %d.",
-                                commanded_state, launcher->state);
+                                 commanded_state, launcher->state);
                     break;
                 }
             break;
             case LAUNCHER_STATE_STEP_UP:
-                if (current_step >= launcher->step_target) {
+                if ((step_current != STEP_UNKNOWN) && (step_current >= launcher->step_target)) {
                     // Done.
-                    ESP_LOGI(TAG, "now at step %d (%d mm).", current_step,
-                            current_step * QRD1114_STEP_LENGTH_MM);
-                    next_state = LAUNCHER_STATE_READY;
+                    launcher->step_target = STEP_UNKNOWN;
+                    motor_stop(launcher->motor);
+                    print_step(step_current, step_ground_level);
+                    next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
                 }
             break;
             case LAUNCHER_STATE_STEP_DOWN:
-                if (current_step <= launcher->step_target) {
+                if ((step_current != STEP_UNKNOWN) && (step_current <= launcher->step_target)) {
                     // Done.
-                    ESP_LOGI(TAG, "now at step %d (%d mm).", current_step,
-                            current_step * QRD1114_STEP_LENGTH_MM);
-                    next_state = LAUNCHER_STATE_READY;
+                    launcher->step_target = STEP_UNKNOWN;
+                    motor_stop(launcher->motor);
+                    print_step(step_current, step_ground_level);
+                    next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
                 }
             break;
             case LAUNCHER_STATE_RUN:
-                // Start skittering
-                ESP_LOGI(TAG, "starting skittering.");
+                next_state = advance_state_commanded_run(launcher,
+                                                         step_current,
+                                                         step_max,
+                                                         step_ground_level);
             break;
             case LAUNCHER_STATE_RUNNING_SKITTERING:
-                // TODO
-                next_state = LAUNCHER_STATE_RUNNING_JUMPING;
+                next_state = advance_state_skittering(launcher,
+                                                      step_current,
+                                                      step_max,
+                                                      step_ground_level);
             break;
             case LAUNCHER_STATE_RUNNING_JUMPING:
-                // TODO
-                next_state = LAUNCHER_STATE_RUNNING_RESETTING;
+                next_state = advance_state_running_jumping(launcher,
+                                                           step_current,
+                                                           step_max,
+                                                           step_ground_level);
+            break;
+            case LAUNCHER_STATE_RUNNING_DANGLING:
+                next_state = advance_state_running_dangling(launcher,
+                                                            step_current,
+                                                            step_max,
+                                                            step_ground_level);
             break;
             case LAUNCHER_STATE_RUNNING_RESETTING:
-                // TODO
-                next_state = LAUNCHER_STATE_READY;
+                next_state = advance_state_running_resetting(launcher,
+                                                            step_current,
+                                                            step_max,
+                                                            step_ground_level);
             break;
             case LAUNCHER_STATE_HALT:
-                // TODO
                 next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
             break;
             default:
@@ -756,8 +1333,20 @@ static void launcher_cb(void *handle, void *arg)
             break;
             case LAUNCHER_STATE_STEP_UP:
             case LAUNCHER_STATE_STEP_DOWN:
+                // Can do these if we don't know our height or are ready
+                if ((launcher->state == LAUNCHER_STATE_READY) ||
+                    (launcher->state == LAUNCHER_STATE_HEIGHT_UNKNOWN)) {
+                    ESP_LOGI(TAG, "starting %s.", name);
+                } else {
+                    ESP_LOGW(TAG, "cannot get to state %s from state %s (only from states %s and %s).",
+                             name, g_launcher_state_name[launcher->state],
+                             g_launcher_state_name[LAUNCHER_STATE_HEIGHT_UNKNOWN],
+                             g_launcher_state_name[LAUNCHER_STATE_READY]);
+                    commanded_state = LAUNCHER_STATE_NULL;
+                }
+            break;
             case LAUNCHER_STATE_RUN:
-                // Can only do these if we're ready
+                // Can only do this  if we're ready
                 if (launcher->state == LAUNCHER_STATE_READY) {
                     ESP_LOGI(TAG, "starting %s.", name);
                 } else {
@@ -838,9 +1427,13 @@ static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused)
 {
     (void) unused;
 
-    // Set the current step to zero
-    retained_ram_t retained_ram = {0};
-    FGR_RRAM_SET(retained_ram);
+    // Set the groud level step to the current step
+    retained_ram_t retained_ram;
+    if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
+        (retained_ram.step_current != STEP_UNKNOWN)) {
+        retained_ram.step_ground_level = retained_ram.step_current;
+        FGR_RRAM_SET(retained_ram);
+    }
 }
 
 // Handle the "this is height max" command.
@@ -850,9 +1443,11 @@ static void handler_this_is_height_max(launcher_t *launcher, uint32_t unused)
 
     // Get the current height
     retained_ram_t retained_ram;
-    if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+    if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
+        (retained_ram.step_ground_level != STEP_UNKNOWN) &&
+        (retained_ram.step_current != STEP_UNKNOWN)) {
         // Set the "height max" value in NVS
-        nvs_height_max_mm_set(retained_ram.current_step * QRD1114_STEP_LENGTH_MM);
+        nvs_height_max_mm_set((retained_ram.step_current - retained_ram.step_ground_level) * QRD1114_STEP_LENGTH_MM);
     }
 }
 
@@ -866,7 +1461,22 @@ static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused)
     nvs_auto_period_seconds_set(DEFAULT_AUTO_PERIOD_SECONDS);
     nvs_height_max_mm_set(DEFAULT_HEIGHT_MAX_MM);
     nvs_speed_mm_per_second_set(DEFAULT_SPEED_MM_PER_SECOND);
+    nvs_track_number_skittering_set(DEFAULT_TRACK_NUMBER_SKITTERING);
+    nvs_track_number_jumping_set(DEFAULT_TRACK_NUMBER_JUMPING);
+    nvs_track_number_resetting_set(DEFAULT_TRACK_NUMBER_RESETTING);
     nvs_random_enable_set(DEFAULT_RANDOM_ENABLE);
+    nvs_mute_set(DEFAULT_MUTE);
+
+    // Set the ground level and current step to unknown
+    retained_ram_t retained_ram;
+    if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+        retained_ram.step_current = STEP_UNKNOWN;
+        retained_ram.step_ground_level = STEP_UNKNOWN;
+        FGR_RRAM_SET(retained_ram);
+    }
+
+    // Set the launcher state back to NULL
+    launcher->state = LAUNCHER_STATE_NULL;
 
     // Anything else TODO?
 }
@@ -879,6 +1489,13 @@ static void handler_emergency_stop(launcher_t *launcher, uint32_t unused)
     // Queue the command to the launcher to halt
     launcher_state_t state = LAUNCHER_STATE_HALT;
     xQueueSend(launcher->queue, &state, portMAX_DELAY);
+}
+
+// Handle the "play track" command.
+static void handler_play_track(launcher_t *launcher, uint32_t track_number)
+{
+    // Play the track
+    audio_play_track(track_number);
 }
 
 // Handle the "auto enable" command.
@@ -925,6 +1542,39 @@ static void handler_speed_mm_per_second(launcher_t *launcher, uint32_t speed)
     // Anything else TODO?
 }
 
+// Handle the "track num skittering" command.
+static void handler_track_number_skittering(launcher_t *launcher, uint32_t track_number)
+{
+    (void) launcher;
+
+    // Write the new setting to NVS
+    nvs_track_number_skittering_set(track_number);
+
+    // Anything else TODO?
+}
+
+// Handle the "track num jumping" command.
+static void handler_track_number_jumping(launcher_t *launcher, uint32_t track_number)
+{
+    (void) launcher;
+
+    // Write the new setting to NVS
+    nvs_track_number_jumping_set(track_number);
+
+    // Anything else TODO?
+}
+
+// Handle the "track num resetting" command.
+static void handler_track_number_resetting(launcher_t *launcher, uint32_t track_number)
+{
+    (void) launcher;
+
+    // Write the new setting to NVS
+    nvs_track_number_resetting_set(track_number);
+
+    // Anything else TODO?
+}
+
 // Handle the "random enable" command.
 static void handler_random_enable(launcher_t *launcher, uint32_t enable)
 {
@@ -932,6 +1582,17 @@ static void handler_random_enable(launcher_t *launcher, uint32_t enable)
 
     // Write the new setting to NVS
     nvs_random_enable_set(enable ? true : false);
+
+    // Anything else TODO?
+}
+
+// Handle the "mute" command.
+static void handler_mute(launcher_t *launcher, uint32_t enable)
+{
+    (void) launcher;
+
+    // Write the new setting to NVS
+    nvs_mute_set(enable ? true : false);
 
     // Anything else TODO?
 }
@@ -1047,8 +1708,11 @@ static int characteristic_this_is_ground_level_cb(uint16_t conn_handle, uint16_t
     CONTEXT_LOCK(context->lock, "characteristic_this_is_ground_level_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_contents_t command_contents = {.command = COMMAND_THIS_IS_GROUND_LEVEL};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+        // Only accept this command if the launcher is in the right state
+        if (can_reset_height_parameters(context->launcher.state)) {
+            command_contents_t command_contents = {.command = COMMAND_THIS_IS_GROUND_LEVEL};
+            return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+        }
     }
 
     CONTEXT_UNLOCK(context->lock, "characteristic_this_is_ground_level_cb");
@@ -1066,8 +1730,11 @@ static int characteristic_this_is_height_max_cb(uint16_t conn_handle, uint16_t a
     CONTEXT_LOCK(context->lock, "characteristic_this_is_height_max_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_contents_t command_contents = {.command = COMMAND_THIS_IS_HEIGHT_MAX};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+        // Only accept this command if the launcher is in the right state
+        if (can_reset_height_parameters(context->launcher.state)) {
+            command_contents_t command_contents = {.command = COMMAND_THIS_IS_HEIGHT_MAX};
+            return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+        }
     }
 
     CONTEXT_UNLOCK(context->lock, "characteristic_this_is_height_max_cb");
@@ -1085,8 +1752,11 @@ static int characteristic_reset_to_defaults_cb(uint16_t conn_handle, uint16_t at
     CONTEXT_LOCK(context->lock, "characteristic_reset_to_defaults_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_contents_t command_contents = {.command = COMMAND_RESET_TO_DEFAULTS};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+        // Only accept this command if the launcher is in the right state
+        if (can_reset_height_parameters(context->launcher.state)) {
+            command_contents_t command_contents = {.command = COMMAND_RESET_TO_DEFAULTS};
+            return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+        }
     }
 
     CONTEXT_UNLOCK(context->lock, "characteristic_reset_to_defaults_cb");
@@ -1109,6 +1779,27 @@ static int characteristic_emergency_stop_cb(uint16_t conn_handle, uint16_t attr_
     }
 
     CONTEXT_UNLOCK(context->lock, "characteristic_emergency_stop_cb");
+
+    return return_code;
+}
+
+// "Play track" characteristic callback.
+static int characteristic_play_track_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                        struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code = BLE_ATT_ERR_UNLIKELY;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_play_track_cb");
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        command_contents_t command_contents = {.command = COMMAND_PLAY_TRACK};
+        // Read the value sent with the BLE command
+        command_contents.value = mbuf_read(ctxt->om);
+        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+    }
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_play_track_cb");
 
     return return_code;
 }
@@ -1208,10 +1899,88 @@ static int characteristic_speed_mm_per_second_cb(uint16_t conn_handle, uint16_t 
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
+        if (command_contents.value < SPEED_MIN_MM_PER_SECOND) {
+            command_contents.value = SPEED_MIN_MM_PER_SECOND;
+        }
     }
     return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
 
     CONTEXT_UNLOCK(context->lock, "characteristic_speed_mm_per_second_cb");
+
+    return return_code;
+}
+
+// "Track num skittering" characteristic callback.
+static int characteristic_track_number_skittering_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                                     struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_track_number_skttering_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_SKITTERING,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
+        // Read the current setting
+        nvs_track_number_skittering_get(&command_contents.value);
+    } else {
+        // Read the value sent with the BLE command
+        command_contents.value = mbuf_read(ctxt->om);
+    }
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_track_number_skttering_cb");
+
+    return return_code;
+}
+
+// "Track num jumping" characteristic callback.
+static int characteristic_track_number_jumping_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_track_number_jumping_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_JUMPING,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
+        // Read the current setting
+        nvs_track_number_jumping_get(&command_contents.value);
+    } else {
+        // Read the value sent with the BLE command
+        command_contents.value = mbuf_read(ctxt->om);
+    }
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_track_number_jumping_cb");
+
+    return return_code;
+}
+
+// "Track num resetting" characteristic callback.
+static int characteristic_track_number_resetting_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                                    struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_track_number_resetting_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_RESETTING,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
+        // Read the current setting
+        nvs_track_number_resetting_get(&command_contents.value);
+    } else {
+        // Read the value sent with the BLE command
+        command_contents.value = mbuf_read(ctxt->om);
+    }
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_track_number_resetting_cb");
 
     return return_code;
 }
@@ -1239,6 +2008,33 @@ static int characteristic_random_enable_cb(uint16_t conn_handle, uint16_t attr_h
     return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
 
     CONTEXT_UNLOCK(context->lock, "characteristic_random_enable_cb");
+
+    return return_code;
+}
+
+// "Mute" characteristic callback.
+static int characteristic_mute_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    int return_code;
+    context_t *context = (context_t *) arg;
+
+    CONTEXT_LOCK(context->lock, "characteristic_mute_cb");
+
+    command_contents_t command_contents = {.command = COMMAND_MUTE,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
+        // Read the current setting
+        bool reading = false;
+        nvs_mute_get(&reading);
+        command_contents.value = (uint32_t) reading;
+    } else {
+        // Read the value sent with the BLE command
+        command_contents.value = mbuf_read(ctxt->om);
+    }
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_mute_cb");
 
     return return_code;
 }
@@ -1277,9 +2073,11 @@ static int characteristic_height_current_mm_cb(uint16_t conn_handle, uint16_t at
         command_contents_t command_contents = {.command = COMMAND_HEIGHT_CURRENT_MM,
                                                .value = (uint32_t) -1};
         retained_ram_t retained_ram;
-        if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+        if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
+            (retained_ram.step_ground_level != STEP_UNKNOWN) &&
+            (retained_ram.step_current != STEP_UNKNOWN)) {
             // Populate the current height if we have it
-            command_contents.value = retained_ram.current_step * QRD1114_STEP_LENGTH_MM;
+            command_contents.value = (retained_ram.step_current - retained_ram.step_ground_level) * QRD1114_STEP_LENGTH_MM;
         }
         return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
@@ -1304,17 +2102,17 @@ static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE2,
-                                                      .name = "DOWN",
-                                                      .characteristic_cb = characteristic_down_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
-                                                      .handler = handler_down
-                                                     },
-                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
-                                                      .uuid = 0xFFE3,
                                                       .name = "UP",
                                                       .characteristic_cb = characteristic_up_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE,
                                                       .handler = handler_up
+                                                     },
+                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+                                                      .uuid = 0xFFE3,
+                                                      .name = "DOWN",
+                                                      .characteristic_cb = characteristic_down_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .handler = handler_down
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE4,
@@ -1344,50 +2142,85 @@ static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE
                                                       .flags = BLE_GATT_CHR_F_WRITE,
                                                       .handler = handler_emergency_stop
                                                      },
-                                                     {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
+                                                     {.type = COMMAND_TYPE_WRITE_ONLY_UINT32,
                                                       .uuid = 0xFFE8,
+                                                      .name = "PLAY TRACK",
+                                                      .characteristic_cb = characteristic_play_track_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .handler = handler_play_track
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
+                                                      .uuid = 0xFFE9,
                                                       .name = "AUTO",
                                                       .characteristic_cb = characteristic_auto_enable_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_auto_enable
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_UINT32,
-                                                      .uuid = 0xFFE9,
+                                                      .uuid = 0xFFEA,
                                                       .name = "AUTO_PERIOD_SECONDS",
                                                       .characteristic_cb = characteristic_auto_period_seconds_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_auto_period_seconds
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_UINT32,
-                                                      .uuid = 0xFFEA,
+                                                      .uuid = 0xFFEB,
                                                       .name = "HEIGHT_MAX_MM",
                                                       .characteristic_cb = characteristic_height_max_mm_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_height_max_mm
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_UINT32,
-                                                      .uuid = 0xFFEB,
+                                                      .uuid = 0xFFEC,
                                                       .name = "SPEED_MM_PER_SECOND",
                                                       .characteristic_cb = characteristic_speed_mm_per_second_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_speed_mm_per_second
                                                      },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_UINT32,
+                                                      .uuid = 0xFFED,
+                                                      .name = "COMMAND_TRACK_NUMBER_SKITTERING",
+                                                      .characteristic_cb = characteristic_track_number_skittering_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_track_number_skittering
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_UINT32,
+                                                      .uuid = 0xFFEE,
+                                                      .name = "COMMAND_TRACK_NUMBER_JUMPING",
+                                                      .characteristic_cb = characteristic_track_number_jumping_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_track_number_jumping
+                                                     },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_UINT32,
+                                                      .uuid = 0xFFEF,
+                                                      .name = "COMMAND_TRACK_NUMBER_RELAXING",
+                                                      .characteristic_cb = characteristic_track_number_resetting_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_track_number_resetting
+                                                     },
                                                      {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
-                                                      .uuid = 0xFFEC,
+                                                      .uuid = 0xFFF0,
                                                       .name = "RANDOM",
                                                       .characteristic_cb = characteristic_random_enable_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_random_enable
                                                      },
+                                                     {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
+                                                      .uuid = 0xFFF1,
+                                                      .name = "MUTE",
+                                                      .characteristic_cb = characteristic_mute_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_mute
+                                                     },
                                                      {.type = COMMAND_TYPE_READ_ONLY,
-                                                      .uuid = 0xFFED,
+                                                      .uuid = 0xFFF2,
                                                       .name = "STATE",
                                                       .characteristic_cb = characteristic_state_cb,
                                                       .flags = BLE_GATT_CHR_F_READ
                                                       // No handler for this one
                                                      },
                                                      {.type = COMMAND_TYPE_READ_ONLY,
-                                                      .uuid = 0xFFEE,
+                                                      .uuid = 0xFFF3,
                                                       .name = "HEIGHT_CURRENT_MM",
                                                       .characteristic_cb = characteristic_height_current_mm_cb,
                                                       .flags = BLE_GATT_CHR_F_READ
@@ -1395,7 +2228,7 @@ static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE
                                                      }};
 
 // Do some checking
-_Static_assert (FGR_UTIL_ARRAY_LENGTH(g_command_data_list) == COMMAND_NUM_OF,
+_Static_assert (FGR_UTIL_ARRAY_LENGTH(g_command_data_list) == COMMAND_NUMBER_OF,
                 "the number of g_command_data_list[] entries does not match the number of commands!");
 
 /* ----------------------------------------------------------------
@@ -1451,11 +2284,18 @@ static const struct ble_gatt_svc_def g_ble_spider_launcher_svcs[] = {
                 .flags = g_command_data_list[COMMAND_RESET_TO_DEFAULTS].flags
             },
             {
-                // "Emergencey stop" characteristic
+                // "Emergency stop" characteristic
                 .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_EMERGENCY_STOP].uuid),
                 .access_cb = g_command_data_list[COMMAND_EMERGENCY_STOP].characteristic_cb,
                 .arg = &g_context,
                 .flags = g_command_data_list[COMMAND_EMERGENCY_STOP].flags
+            },
+            {
+                // "Play track" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_PLAY_TRACK].uuid),
+                .access_cb = g_command_data_list[COMMAND_PLAY_TRACK].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_PLAY_TRACK].flags
             },
             {
                 // "Auto enable" characteristic
@@ -1486,11 +2326,39 @@ static const struct ble_gatt_svc_def g_ble_spider_launcher_svcs[] = {
                 .flags = g_command_data_list[COMMAND_SPEED_MM_PER_SECOND].flags
             },
             {
+                // "Track num skittering" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_TRACK_NUMBER_SKITTERING].uuid),
+                .access_cb = g_command_data_list[COMMAND_TRACK_NUMBER_SKITTERING].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_TRACK_NUMBER_SKITTERING].flags
+            },
+            {
+                // "Track num jumping" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_TRACK_NUMBER_JUMPING].uuid),
+                .access_cb = g_command_data_list[COMMAND_TRACK_NUMBER_JUMPING].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_TRACK_NUMBER_JUMPING].flags
+            },
+            {
+                // "Track num resetting" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_TRACK_NUMBER_RESETTING].uuid),
+                .access_cb = g_command_data_list[COMMAND_TRACK_NUMBER_RESETTING].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_TRACK_NUMBER_RESETTING].flags
+            },
+            {
                 // "Random enable" characteristic
                 .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_RANDOM_ENABLE].uuid),
                 .access_cb = g_command_data_list[COMMAND_RANDOM_ENABLE].characteristic_cb,
                 .arg = &g_context,
                 .flags = g_command_data_list[COMMAND_RANDOM_ENABLE].flags
+            },
+            {
+                // "Mute" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_MUTE].uuid),
+                .access_cb = g_command_data_list[COMMAND_MUTE].characteristic_cb,
+                .arg = &g_context,
+                .flags = g_command_data_list[COMMAND_MUTE].flags
             },
             {
                 // "State" characteristic
@@ -1541,6 +2409,9 @@ static void command_cb(void *handle, void *arg)
                 case COMMAND_TYPE_WRITE_ONLY_NO_VALUE:
                     ESP_LOGI(TAG, "command %s (0x%04x).", name, uuid);
                 break;
+                case COMMAND_TYPE_WRITE_ONLY_UINT32:
+                    ESP_LOGI(TAG, "command %s (0x%04x), write: %d.", name, uuid, value);
+                break;
                 case COMMAND_TYPE_READ_WRITE_BOOLEAN:
                     if (command_contents.read_not_write) {
                         ESP_LOGI(TAG, "command %s (0x%04x), read: %s.",
@@ -1583,16 +2454,27 @@ static void command_cb(void *handle, void *arg)
  * -------------------------------------------------------------- */
 
 // Callback called each time the QRD1114 sensor on the motor is triggered.
-static void motor_callback(void *motor, uint32_t delta_us, void *param)
+static void motor_callback(void *motor, void *param)
 {
-    context_t *context = (context_t *) param;
+    launcher_t *launcher = (launcher_t *) param;
 
     (void) motor;
 
-    // TODO
+    retained_ram_t retained_ram = {.step_current = 0,
+                                   .step_ground_level = STEP_UNKNOWN};
+    FGR_RRAM_GET(retained_ram);
 
-    (void) delta_us;
-    (void) context;
+    if (retained_ram.step_current == STEP_UNKNOWN) {
+        retained_ram.step_current = 0;
+    } else {
+        if (launcher->direction_up_not_down) {
+            retained_ram.step_current++;
+        } else {
+            retained_ram.step_current--;
+        }
+    }
+
+    FGR_RRAM_SET(retained_ram);
 }
 
 /* ----------------------------------------------------------------
@@ -1602,6 +2484,8 @@ static void motor_callback(void *motor, uint32_t delta_us, void *param)
 // Initialisation.
 static esp_err_t init(context_t *context)
 {
+    launcher_t *launcher = &context->launcher;
+
     // Allow us to feed the watchdog
     esp_task_wdt_add(NULL);
 
@@ -1617,14 +2501,15 @@ static esp_err_t init(context_t *context)
         CONTEXT_LOCK(context->lock, "init");
 
         retained_ram_t retained_ram;
-        if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+        if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
+            (retained_ram.step_current != STEP_UNKNOWN) &&
+            (retained_ram.step_ground_level != STEP_UNKNOWN)) {
             // There is retained RAM, which means we
             // were running, so set the initial
             // state to resetting
+            int32_t height_steps = retained_ram.step_current - retained_ram.step_ground_level;
             ESP_LOGI(TAG, "warm start (current height is %d mm (%d step(s))).",
-                     retained_ram.current_step * QRD1114_STEP_LENGTH_MM,
-                     retained_ram.current_step);
-            launcher_t *launcher = &context->launcher;
+                     height_steps * QRD1114_STEP_LENGTH_MM, height_steps);
             launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
         }
 
@@ -1633,15 +2518,54 @@ static esp_err_t init(context_t *context)
             err = motor_brushless_init();
             if (err == ESP_OK) {
                 err = -ESP_ERR_NO_MEM;
-                context->motor = motor_brushless_create(CONFIG_SPIDER_LAUNCHER_MOTOR_PWM_PIN,
-                                                        CONFIG_SPIDER_LAUNCHER_MOTOR_DIRECTION_PIN,
-                                                        CONFIG_SPIDER_LAUNCHER_QRD1114_PIN,
-                                                        8, motor_callback, context);
-                if (context->motor) {
+                launcher->motor = motor_brushless_create(CONFIG_SPIDER_LAUNCHER_MOTOR_PWM_PIN,
+                                                         CONFIG_SPIDER_LAUNCHER_MOTOR_DIRECTION_PIN,
+                                                         CONFIG_SPIDER_LAUNCHER_QRD1114_PIN,
+                                                         motor_callback, launcher);
+                if (launcher->motor) {
                     err = ESP_OK;
                 }
             }
         }
+
+#if defined(CONFIG_SPIDER_LAUNCHER_UART_NUM) && (CONFIG_SPIDER_LAUNCHER_UART_NUM >= 0)
+        // Initialise a UART to control the DY HV8F audio board
+        if (err == ESP_OK) {
+            const uart_config_t cfg = {
+                .baud_rate = 9600,
+                .data_bits = UART_DATA_8_BITS,
+                .parity = UART_PARITY_DISABLE,
+                .stop_bits = UART_STOP_BITS_1,
+                .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+                .source_clk = UART_SCLK_DEFAULT,
+            };
+
+            err = -uart_driver_install(CONFIG_SPIDER_LAUNCHER_UART_NUM, UART_RX_BUFFFER_SIZE, 0, 0, NULL, 0);
+            if (err == ESP_OK) {
+                err = -uart_param_config(CONFIG_SPIDER_LAUNCHER_UART_NUM, &cfg);
+            }
+            if (err == ESP_OK) {
+                err = -uart_set_pin(CONFIG_SPIDER_LAUNCHER_UART_NUM,
+                                    CONFIG_SPIDER_LAUNCHER_AUDIO_UART_TXD_PIN,
+                                    CONFIG_SPIDER_LAUNCHER_AUDIO_UART_RXD_PIN,
+                                    UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+            }
+        }
+#else
+    // Set the pins that control the audio track all high so that they can be pulled low
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0 >= 0)
+    audio_play_set_pin(0xF, 0x01, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0, true);
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1 >= 0)
+    audio_play_set_pin(0xF, 0x02, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1, true);
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2 >= 0)
+    audio_play_set_pin(0xF, 0x04, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2, true);
+#  endif
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3 >= 0)
+    audio_play_set_pin(0xF, 0x08, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3, true);
+#  endif
+#endif
 
         // Initialise tasking, FGR style
         if (err == ESP_OK) {
@@ -1779,10 +2703,24 @@ void app_main(void)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "initialization complete.");
         ESP_LOGI(TAG, "waiting for BLE connections/commands.");
-        while (context->running) {
+        uint32_t track_number = 1;
+        bool mute = false;
+        nvs_mute_get(&mute);
+        if (mute) {
+            ESP_LOGI(TAG, "muted, not playing an audio.");
+        }
+        while (1) {
             // Let BLE commands do their thing
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(3000));
             esp_task_wdt_reset();
+            nvs_mute_get(&mute);
+            if (!mute) {
+                audio_play_track(track_number);
+                track_number++;
+                if (track_number > 4) {
+                    track_number = 1;
+                }
+            }
         }
         esp_task_wdt_delete(NULL);
     } else {

@@ -28,6 +28,7 @@
 #include "esp_log.h"
 #include "driver/mcpwm_prelude.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 #include "sys/queue.h"
 
 #include "fgr_util.h"
@@ -49,6 +50,15 @@
 // with a timer resolution of 1 MHz gives 50us, 20 KHz
 #define TIMER_PERIOD_TICKS 500
 
+// How often to sample a sensor pin in milliseconds
+#define SENSOR_SAMPLE_MS 1
+
+// The maximum confidence value
+#define SENSOR_CONFIDENCE_MAX 8   // max confidence value
+
+// The confidence needed to assert that the sensor is triggered
+#define SENSOR_THRESHOLD 5
+
 /* ----------------------------------------------------------------
  * TYPES
  * -------------------------------------------------------------- */
@@ -59,17 +69,15 @@ typedef struct motor_t {
     int32_t pwm_pin;
     int32_t dir_pin;
     int32_t sensor_pin;
-    size_t pulses_per_rotation;
     brushless_motor_cb_t cb;
     void *cb_param;
     mcpwm_timer_handle_t timer;
     mcpwm_oper_handle_t operator;
     mcpwm_cmpr_handle_t comparator;
     mcpwm_gen_handle_t generator;
-    mcpwm_cap_timer_handle_t capture_timer;
-    mcpwm_cap_channel_handle_t capture_channel;
-    bool last_capture_populated;
-    uint32_t last_capture;
+    int32_t sensor_confidence;
+    bool sensor_state;
+    esp_timer_handle_t sensor_timer;
     SLIST_ENTRY(motor_t) next;
 } motor_t;
 
@@ -93,22 +101,31 @@ static context_t g_context = {0};
  * STATIC FUNCTIONS
  * -------------------------------------------------------------- */
 
-// Interrupt service routine for MCPWM sensor capture.
-static bool mcpwm_capture_isr(mcpwm_cap_channel_handle_t capture_channel,
-                              const mcpwm_capture_event_data_t *edata,
-                              void *user_data)
+// Sample the sensor
+static void sensor_sample(void *arg)
 {
-    motor_t *motor = (motor_t *) user_data;
-    uint32_t now = edata->cap_value;
-    uint32_t delta_us = now - motor->last_capture;  // unsigned wrap is fine
+    motor_t *motor = (motor_t *) arg;
+    bool raw = (gpio_get_level(motor->sensor_pin) == 0);
 
-    if (motor->cb) {
-        motor->cb(motor, motor->last_capture_populated ? delta_us : 0, motor->cb_param);
+    if (raw) {
+        if (motor->sensor_confidence < SENSOR_CONFIDENCE_MAX) {
+            motor->sensor_confidence++;
+        }
+    } else {
+        if (motor->sensor_confidence > 0) {
+            motor->sensor_confidence--;
+        }
     }
-    motor->last_capture = now;
-    motor->last_capture_populated = true;
 
-    return false;
+    // Hysteresis on the confidence value
+    if (!motor->sensor_state && (motor->sensor_confidence >= SENSOR_THRESHOLD)) {
+        motor->sensor_state = true;
+        if (motor->cb) {
+            motor->cb(motor, motor->cb_param);
+        }
+    } else if (motor->sensor_state && (motor->sensor_confidence == 0)) {
+        motor->sensor_state = false;
+    }
 }
 
 // Clean up a motor.
@@ -130,13 +147,9 @@ static void clean_up(motor_t *motor)
             mcpwm_timer_disable(motor->timer);
             mcpwm_del_timer(motor->timer);
         }
-        if (motor->capture_channel) {
-            mcpwm_capture_channel_disable(motor->capture_channel);
-            mcpwm_del_capture_channel(motor->capture_channel);
-        }
-        if (motor->capture_timer) {
-            mcpwm_capture_timer_disable(motor->capture_timer);
-            mcpwm_del_capture_timer(motor->capture_timer);
+        if (motor->sensor_timer) {
+            esp_timer_stop(motor->sensor_timer);
+            esp_timer_delete(motor->sensor_timer);
         }
         gpio_reset_pin(motor->pwm_pin);
         gpio_reset_pin(motor->dir_pin);
@@ -205,7 +218,7 @@ void motor_brushless_deinit()
 
 // Create a brushless motor.
 void *motor_brushless_create(int32_t pwm_pin, int32_t dir_pin,
-                             int32_t sensor_pin, size_t pulses_per_rotation,
+                             int32_t sensor_pin,
                              brushless_motor_cb_t cb, void *cb_param)
 {
     motor_t *motor = malloc(sizeof(*motor));
@@ -219,7 +232,6 @@ void *motor_brushless_create(int32_t pwm_pin, int32_t dir_pin,
         motor->pwm_pin = pwm_pin;
         motor->dir_pin = dir_pin;
         motor->sensor_pin = sensor_pin;
-        motor->pulses_per_rotation = pulses_per_rotation;
         motor->cb = cb;
         motor->cb_param = cb_param;
 
@@ -232,11 +244,6 @@ void *motor_brushless_create(int32_t pwm_pin, int32_t dir_pin,
             .period_ticks = TIMER_PERIOD_TICKS
         };
         esp_err_t err = mcpwm_new_timer(&cfg, &motor->timer);
-
-        // Start the timer running continuously
-        if (err == ESP_OK) {
-            err = mcpwm_timer_start_stop(motor->timer, MCPWM_TIMER_START_NO_STOP);
-        }
 
         // Create an MCPWM operator
         if (err == ESP_OK) {
@@ -278,8 +285,16 @@ void *motor_brushless_create(int32_t pwm_pin, int32_t dir_pin,
                 MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
                                                motor->comparator,
                                                MCPWM_GEN_ACTION_LOW));
-            // Override to off for now
-            mcpwm_generator_set_force_level(motor->generator, 0, true);
+        }
+
+        // Enable the timer
+        if (err == ESP_OK) {
+            err = mcpwm_timer_enable(motor->timer);
+        }
+
+        // Start the timer running continuously
+        if (err == ESP_OK) {
+            err = mcpwm_timer_start_stop(motor->timer, MCPWM_TIMER_START_NO_STOP);
         }
 
         // Set the direction pin to be an output
@@ -289,29 +304,28 @@ void *motor_brushless_create(int32_t pwm_pin, int32_t dir_pin,
         }
 
         // Deal with the sensor pin
-        if ((err == ESP_OK) && (sensor_pin >= 0)) {
-            // Capture timer: 1 MHz -> 1 us ticks, which give delta_us in the callback
-            mcpwm_capture_timer_config_t cfg = {.group_id = 0,
-                                                .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
-                                                .resolution_hz = 1000000};
-            err = mcpwm_new_capture_timer(&cfg, &motor->capture_timer);
+        if (sensor_pin >= 0) {
+            gpio_config_t cfg = {
+                .pin_bit_mask = 1ULL << sensor_pin,
+                .mode = GPIO_MODE_INPUT,
+                .pull_up_en = GPIO_PULLUP_ENABLE,
+                .pull_down_en = GPIO_PULLDOWN_DISABLE,
+                .intr_type = GPIO_INTR_DISABLE,
+            };
+            err = gpio_config(&cfg);
+
             if (err == ESP_OK) {
-                mcpwm_capture_channel_config_t cfg = {.gpio_num = sensor_pin,
-                                                      .prescale = 1,
-                                                      .flags.neg_edge = true,
-                                                      .flags.pos_edge = false,
-                                                      .flags.pull_down = false,
-                                                      .flags.pull_up = true};
-                err = mcpwm_new_capture_channel(motor->capture_timer, &cfg, &motor->capture_channel);
+                esp_timer_create_args_t args = {
+                    .callback = sensor_sample,
+                    .arg = motor,
+                    .dispatch_method = ESP_TIMER_TASK,
+                    .name = "sensor_sample",
+                };
+                err = esp_timer_create(&args, &motor->sensor_timer);
             }
+
             if (err == ESP_OK) {
-                mcpwm_capture_event_callbacks_t cbs = {.on_cap = mcpwm_capture_isr};
-                err = mcpwm_capture_channel_register_event_callbacks(motor->capture_channel, &cbs, motor);
-            }
-            if (err == ESP_OK) {
-                mcpwm_capture_timer_enable(motor->capture_timer);
-                mcpwm_capture_timer_start(motor->capture_timer);
-                mcpwm_capture_channel_enable(motor->capture_channel);
+                err = esp_timer_start_periodic(motor->sensor_timer, SENSOR_SAMPLE_MS * 1000);
             }
         }
 
@@ -339,7 +353,7 @@ void motor_brushless_destroy(void *motor)
 // Set the speed and direction of motor rotation.
 int32_t motor_brushless_set_speed(void *motor, int32_t pwm_rate_percent)
 {
-    int32_t err = -ESP_ERR_INVALID_ARG;
+    int32_t err = ESP_ERR_INVALID_ARG;
 
     if (motor) {
         err = ESP_OK;
@@ -350,12 +364,9 @@ int32_t motor_brushless_set_speed(void *motor, int32_t pwm_rate_percent)
             pwm_rate_percent = -100;
         }
         if (pwm_rate_percent == 0) {
-            // True zero: force output low
-            mcpwm_generator_set_force_level(((motor_t *) motor)->generator, 0, true);
+            // Timer off
+            err = mcpwm_comparator_set_compare_value(((motor_t *) motor)->comparator, 0);
         } else {
-            // Release force, let PWM drive the pin
-            mcpwm_generator_set_force_level(((motor_t *) motor)->generator, -1, false);
-
             // Set direction
             gpio_set_level(((motor_t *) motor)->dir_pin, (pwm_rate_percent < 0) ? 1 : 0);
 
@@ -365,11 +376,12 @@ int32_t motor_brushless_set_speed(void *motor, int32_t pwm_rate_percent)
                 abs_pwm_rate_percent = -abs_pwm_rate_percent;
             }
             uint32_t duty_ticks = (abs_pwm_rate_percent * TIMER_PERIOD_TICKS) / 100;
-            mcpwm_comparator_set_compare_value(((motor_t *) motor)->comparator, duty_ticks);
+            err = mcpwm_comparator_set_compare_value(((motor_t *) motor)->comparator, duty_ticks);
         }
     }
 
-    return err;
+    // Return negative value from esp_err_t.
+    return -err;
 }
 
 // End of file

@@ -37,14 +37,9 @@ extern "C" {
  * with a brushless motor.
  *
  * @param motor     the handle that was returned by motor_brushless_create().
- * @param delta_us  the time in microseconds since the previous trigger
- *                  of the sensor.  The first call after motor_brushless_create()
- *                  has no meaningful previous trigger and passes 0.
  * @param param     cb_param as passed to motor_brushless_create().
- *
- * IMPORTANT: this callback is called in interrupt context.
  */
-typedef void (*brushless_motor_cb_t) (void *motor, uint32_t delta_us, void *param);
+typedef void (*brushless_motor_cb_t) (void *motor, void *param);
 
 /* ----------------------------------------------------------------
  * FUNCTIONS
@@ -78,20 +73,15 @@ void motor_brushless_deinit();
  *                            a rotation sensor; use -1 if there is none.
  *                            A triggering of the sensor should pull
  *                            sensor_pin low.
- * @param pulses_per_rotation the number of low pulses on sensor_pin for one
- *                            rotation of the motor; ignored if sensor_pin
- *                            is not supplied.
  * @param cb                  a callback to be called every time
  *                            sensor_pin is triggered; ignored if
  *                            sensor_pin is not supplied, may be NULL.
- *                            IMPORTANT: this callback is called in
- *                            interrupt context.
  * @param cb_param            a user parameter that will be passsed
  *                            to cb when it is called; ignored if cb is NULL.
  * @return                    a handle for the motor, else NULL.
  */
 void *motor_brushless_create(int32_t pwm_pin, int32_t dir_pin,
-                             int32_t sensor_pin, size_t pulses_per_rotation,
+                             int32_t sensor_pin,
                              brushless_motor_cb_t cb, void *cb_param);
 
 /** Delete a brushless motor.  It is always safe to call this
@@ -109,7 +99,9 @@ void motor_brushless_destroy(void *motor);
  *                         motor_brushless_create().
  * @param pwm_rate_percent a signed PWM percentage, 0 for zero speed,
  *                         -100 or 100 for maximum speed in either
- *                         direction.
+ *                         direction.  A negative PWM value will cause
+ *                         the dir_pin to be high, a zero or positive
+ *                         PWM value low.
  * @return                 ESP_OK on success, else a negative value from
  *                         esp_err_t.
  */

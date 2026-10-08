@@ -10,5 +10,8 @@
       "--compile-commands-dir=/mnt/windows/temp/spider_launcher/software/esp32/application/build"
     ],
     "idf.flashType": "UART",
-    "idf.port": "/dev/ttyACM0"
+    "idf.port": "/dev/ttyACM0",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ]
 }
