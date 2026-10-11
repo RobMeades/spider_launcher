@@ -6,6 +6,7 @@ The main file is `spider_launcher.blend`, the components of which are exported t
 # Printing
 All parts should be printed in \[black\] ASA, 15% in-fill, fastest speed, no supports required, brim if you think you need it, except for the following:
 
+- `spider_eye_big_lens_x2` is the only part that should be printed in transparent PETG rather than ASA, following the advice (here)[http://www.meades.org/misc/big_round_button/big_round_button.html#transparent_petg_printing] for maximum transparency, supports on the print bed,
 - `spider_launcher_nylon_line_guide_x2.stl`: print at a higher resolution (e.g. 0.1&nbsp;mm layer height) if you can, for a smoother edge,
 - `spider_launcher_pole_bug_eyes.stl`: best sliced in half, width-wise, in your printer's slicer program, then both halves can be placed on their cut faces, printed (at 0.1&nbsp;mm layer for best curves) with supports on the print bed and cyanoacrylated together afterwards,
 - `spider_launcher_pole_top_bracket.stl`: similarly, can be chopped into two, in the middle of the thickest part, in your printer's slicer program, then the two parts can be cyanoacrylated together afterwards,
