@@ -355,10 +355,28 @@ static const char *g_launcher_state_name[] = {"NULL",
 _Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name) == LAUNCHER_STATE_NUMBER_OF,
                 "the number of g_launcher_state_name[] entries does not match the number of launcher states!");
 
+// Table of launcher states to LED colours
+static const fgr_ws2812_colour_t g_launcher_state_colour[] = {FGR_WS2812_LED_COLOUR_WHITE,      // NULL
+                                                              FGR_WS2812_LED_COLOUR_CYAN,       // HEIGHT_UNKNOWN
+                                                              FGR_WS2812_LED_COLOUR_GREEN,      // READY
+                                                              FGR_WS2812_LED_COLOUR_YELLOW,     // STEP_UP
+                                                              FGR_WS2812_LED_COLOUR_YELLOW,     // STEP_DOWN
+                                                              FGR_WS2812_LED_COLOUR_MAGENTA,    // RUN
+                                                              FGR_WS2812_LED_COLOUR_MAGENTA,    // RUNNING_SKITTERING
+                                                              FGR_WS2812_LED_COLOUR_MAGENTA,    // RUNNING_JUMPING
+                                                              FGR_WS2812_LED_COLOUR_MAGENTA,    // RUNNING_DANGLING
+                                                              FGR_WS2812_LED_COLOUR_MAGENTA,    // RUNNING_RESETTING
+                                                              FGR_WS2812_LED_COLOUR_NONE};     // HALT
+
+// Do some checking
+_Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_colour) == LAUNCHER_STATE_NUMBER_OF,
+                "the number of g_launcher_state_colour[] entries does not match the number of launcher states!");
+
+
 // The durations of the known audio tracks, in order of track number
 // noting that 0 is unused
 static const uint32_t g_track_duration_ms[] = {0, 1000, 1000, 1000,
-                                               14000, 9000, 1000, 1000,
+                                               14000, 11000, 1000, 1000,
                                                1000, 1000};
 
 // THERE ARE MORE VARIABLES FURTHER DOWN
@@ -1023,6 +1041,14 @@ static void motor_stop(void *motor)
     }
 }
 
+// Set the LED breathe colour according to its new state
+static void set_led_breathe_colour(launcher_state_t state)
+{
+    if (state < FGR_UTIL_ARRAY_LENGTH((g_launcher_state_colour))) {
+        fgr_debug_led_breathe_set(g_launcher_state_colour[state]);
+    }
+}
+
 // Advance state based on commanded state LAUNCHER_STATE_STEP_UP.
 static launcher_state_t advance_state_commanded_step_up(launcher_t *launcher,
                                                         int32_t step_current,
@@ -1292,7 +1318,7 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                         case LAUNCHER_STATE_STEP_DOWN:
                             next_state = advance_state_commanded_step_down(launcher,
                                                                            step_current,
-                                                                           STEP_UNKNOWN);
+                                                                           step_ground_level);
                         break;
                         case LAUNCHER_STATE_NULL:
                             // Nothing to do
@@ -1423,6 +1449,7 @@ static void launcher_cb(void *handle, void *arg)
                 // advancement, they cannot be commanded by the user
                 ESP_LOGW(TAG, "ignoring command to enter state %s (%d).", name, commanded_state);
                 commanded_state = LAUNCHER_STATE_NULL;
+                    fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
             break;
             case LAUNCHER_STATE_STEP_UP:
             case LAUNCHER_STATE_STEP_DOWN:
@@ -1436,6 +1463,7 @@ static void launcher_cb(void *handle, void *arg)
                              g_launcher_state_name[LAUNCHER_STATE_HEIGHT_UNKNOWN],
                              g_launcher_state_name[LAUNCHER_STATE_READY]);
                     commanded_state = LAUNCHER_STATE_NULL;
+                    fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
                 }
             break;
             case LAUNCHER_STATE_RUN:
@@ -1447,6 +1475,7 @@ static void launcher_cb(void *handle, void *arg)
                              name, g_launcher_state_name[launcher->state],
                              g_launcher_state_name[LAUNCHER_STATE_READY]);
                     commanded_state = LAUNCHER_STATE_NULL;
+                    fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
                 }
             break;
             case LAUNCHER_STATE_HALT:
@@ -1456,6 +1485,7 @@ static void launcher_cb(void *handle, void *arg)
             default:
                 ESP_LOGE(TAG, "commanded to enter unknown state (%d)!", commanded_state);
                 commanded_state = LAUNCHER_STATE_NULL;
+                fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
             break;
         }
 
@@ -1465,6 +1495,7 @@ static void launcher_cb(void *handle, void *arg)
             if (next_state != LAUNCHER_STATE_NULL) {
                 ESP_LOGI(TAG, "state transition due to commanded state %s, %s -> %s.", name,
                          g_launcher_state_name[launcher->state], g_launcher_state_name[next_state]);
+                set_led_breathe_colour(next_state);
                 launcher->state = next_state;
             }
         }
@@ -1475,6 +1506,7 @@ static void launcher_cb(void *handle, void *arg)
     if (next_state != LAUNCHER_STATE_NULL) {
         ESP_LOGI(TAG, "internal state transition %s -> %s.",
                  g_launcher_state_name[launcher->state], g_launcher_state_name[next_state]);
+        set_led_breathe_colour(next_state);
         launcher->state = next_state;
     }
 
@@ -1744,6 +1776,12 @@ static int queue_command(uint16_t conn_handle, uint16_t attr_handle,
             ESP_LOGE(TAG, "received unknown operation: %d (0x%02x)!", ctxt->op, ctxt->op);
         }
         break;
+    }
+
+    if (return_code == 0) {
+        fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_WS2812_LED_COLOUR_BLUE);
+    } else {
+        fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
     }
 
     return return_code;
@@ -2629,7 +2667,7 @@ static void motor_callback(void *motor, void *param)
  * -------------------------------------------------------------- */
 
 // Initialisation.
-static esp_err_t init(context_t *context)
+static int32_t init(context_t *context)
 {
     launcher_t *launcher = &context->launcher;
 
@@ -2637,7 +2675,7 @@ static esp_err_t init(context_t *context)
     esp_task_wdt_add(NULL);
 
     // Create mutex to guard the context
-    esp_err_t err = -ESP_ERR_NO_MEM;
+    int32_t err = -ESP_ERR_NO_MEM;
     context->lock = xSemaphoreCreateMutex();
     if (context->lock) {
         err = ESP_OK;
@@ -2648,16 +2686,22 @@ static esp_err_t init(context_t *context)
         CONTEXT_LOCK(context->lock, "init");
 
         retained_ram_t retained_ram;
-        if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
-            (retained_ram.step_current != STEP_UNKNOWN) &&
-            (retained_ram.step_ground_level != STEP_UNKNOWN)) {
-            // There is retained RAM, which means we
-            // were running, so set the initial
-            // state to resetting
-            int32_t height_steps = retained_ram.step_current - retained_ram.step_ground_level;
-            ESP_LOGI(TAG, "warm start (current height is %d mm (%d step(s))).",
-                     height_steps * QRD1114_STEP_LENGTH_MM, height_steps);
-            launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
+        if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+            if ((retained_ram.step_current != STEP_UNKNOWN) &&
+                (retained_ram.step_ground_level != STEP_UNKNOWN)) {
+                // There is retained RAM, which means we
+                // were running, so set the initial
+                // state to resetting
+                int32_t height_steps = retained_ram.step_current - retained_ram.step_ground_level;
+                ESP_LOGI(TAG, "warm start (current height is %d mm (%d step(s))).",
+                        height_steps * QRD1114_STEP_LENGTH_MM, height_steps);
+                launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
+            }
+        } else {
+            // Set stored position and ground level to definitively unknown
+            retained_ram.step_current = STEP_UNKNOWN;
+            retained_ram.step_ground_level = STEP_UNKNOWN;
+            FGR_RRAM_SET(retained_ram);
         }
 
         // Initialise a brushless motor
@@ -2846,7 +2890,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "app_main start");
 
-    esp_err_t err = init(context);
+    int32_t err = init(context);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "initialization complete.");
         ESP_LOGI(TAG, "waiting for BLE connections/commands.");

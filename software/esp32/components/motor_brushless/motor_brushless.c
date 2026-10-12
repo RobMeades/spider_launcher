@@ -15,7 +15,7 @@
  */
 
 /** @file
- * @brief Task related functions for a node of the front garden railway.
+ * @brief Task A brushless motor driver.
  */
 
 // Ensure we are compiling with maximum debug, can then be trimmed

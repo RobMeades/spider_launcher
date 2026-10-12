@@ -287,6 +287,9 @@ int32_t fgr_debug_init()
                                         CONFIG_FGR_DEBUG_LED_PIN, 1,
                                         FGR_DEBUG_LED_WS2812_GRB,
                                         &g_context.ws2812_handle);
+            if (err == ESP_OK) {
+                err = fgr_ws2812_led_breathe_on(g_context.ws2812_handle, -1);
+            }
 #  else
             // Configure our single colour debug LED
             err = gpio_set_level(CONFIG_FGR_DEBUG_LED_PIN, 1);
