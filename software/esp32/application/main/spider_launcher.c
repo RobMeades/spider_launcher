@@ -43,6 +43,7 @@
  * for details).
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <inttypes.h>
@@ -134,7 +135,7 @@
 #define DEFAULT_AUTO_ENABLE false
 
 // Default value for "auto period".
-#define DEFAULT_AUTO_PERIOD_SECONDS 60
+#define DEFAULT_AUTO_PERIOD_SECONDS 180
 
 // Default value for "height max".
 #define DEFAULT_HEIGHT_MAX_MM 4000
@@ -192,6 +193,9 @@
 // How long to keep the IO lines at the signalled level when running
 // the audio board in IO mode.
 #define AUDIO_IO_WAIT_TIME_MS 100
+
+// Retry time for auto mode if it was unable to run
+#define AUTO_MODE_RETRY_TIME_SECONDS 5
 
 /* ----------------------------------------------------------------
  * TYPES
@@ -259,8 +263,8 @@ typedef struct {
 
 // The launcher context
 typedef struct {
-    QueueHandle_t queue;
-    TaskHandle_t task;
+    QueueHandle_t queue_state;
+    TaskHandle_t task_state;
     launcher_state_t state;
     int32_t step_target;
     bool direction_up_not_down;
@@ -268,6 +272,9 @@ typedef struct {
     launcher_timer_t timer_b;
     bool random_enable;
     bool temporary_stop;
+    TaskHandle_t task_auto;
+    uint32_t auto_period_seconds;
+    launcher_timer_t timer_auto;
     void *motor;
 } launcher_t;
 
@@ -699,7 +706,7 @@ static void audio_play_track(uint32_t track_number)
     buffer[FGR_UTIL_ARRAY_LENGTH(buffer) - 1] = checksum;
 
     int32_t x = uart_write_bytes(CONFIG_SPIDER_LAUNCHER_UART_NUM, buffer, sizeof(buffer));
-    ESP_LOGI("DEBUG", "To play audio track %d sent %d byte(s) {0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x} on UART %d, TXD on pin %d.",
+    ESP_LOGI("DEBUG", "to play audio track %d sent %d byte(s) {0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x} on UART %d, TXD on pin %d.",
              track_number, x, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], CONFIG_SPIDER_LAUNCHER_UART_NUM,
              CONFIG_SPIDER_LAUNCHER_AUDIO_UART_TXD_PIN);
 
@@ -729,7 +736,7 @@ static void audio_play_track(uint32_t track_number)
     bit_count++;
 #  endif
 
-    ESP_LOGI(TAG, "To play audio track %d, setting IO lines (%d line(s)) to 0x%1x for %d ms.",
+    ESP_LOGI(TAG, "to play audio track %d, setting IO lines (%d line(s)) to 0x%1x for %d ms.",
              track_number, bit_count, bit_pattern, AUDIO_IO_WAIT_TIME_MS);
 
     vTaskDelay(pdMS_TO_TICKS(AUDIO_IO_WAIT_TIME_MS));
@@ -981,7 +988,7 @@ static bool can_reset_height_parameters(launcher_state_t launcher_state)
 }
 
 // Start a timer.
-static void timer_start(launcher_timer_t *timer, int64_t duration_us)
+static void timer_start_us(launcher_timer_t *timer, int64_t duration_us)
 {
     timer->start_us = esp_timer_get_time();
     timer->duration_us = duration_us;
@@ -993,6 +1000,34 @@ static bool timer_has_expired(launcher_timer_t *timer)
     int64_t now_us = esp_timer_get_time();
     int64_t elapsed_us = now_us - timer->start_us;
     return elapsed_us > timer->duration_us;
+}
+
+// Task callback to run auto mode.
+static void auto_cb(void *handle, void *arg)
+{
+    launcher_t *launcher = (launcher_t *) arg;
+    bool auto_mode_enabled = false;
+
+    (void) handle;
+
+    nvs_auto_enable_get(&auto_mode_enabled);
+    if (auto_mode_enabled && timer_has_expired(&launcher->timer_auto)) {
+        if (launcher->state == LAUNCHER_STATE_READY) {
+            // Start the next run
+            launcher_state_t state = LAUNCHER_STATE_RUN;
+            xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
+            nvs_auto_period_seconds_get(&launcher->auto_period_seconds);
+            ESP_LOGI(TAG, "### Auto mode timer expired (next expiry in %d second(s)) ###",
+                     launcher->auto_period_seconds);
+        } else {
+            // Couldn't start, try again in a shorter time
+            launcher->auto_period_seconds = AUTO_MODE_RETRY_TIME_SECONDS;
+            ESP_LOGI(TAG, "Unable to auto-run in state %s, retrying in %d second(s).",
+                     g_launcher_state_name[launcher->state], launcher->auto_period_seconds);
+        }
+        // Set the next timeout
+        timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
+    }
 }
 
 // Print out the current step and height
@@ -1115,7 +1150,7 @@ static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
         if (track_number < FGR_UTIL_ARRAY_LENGTH(g_track_duration_ms)) {
             duration_us = g_track_duration_ms[track_number] * 1000;
         }
-        timer_start(&launcher->timer_a, duration_us);
+        timer_start_us(&launcher->timer_a, duration_us);
 
         bool mute = false;
         nvs_mute_get(&mute);
@@ -1144,8 +1179,8 @@ static launcher_state_t advance_state_skittering(launcher_t *launcher,
     if (timer_has_expired(&launcher->timer_a)) {
         // Prepare for randomness
         nvs_random_enable_get(&launcher->random_enable);
-        timer_start(&launcher->timer_a, RANDOM_PAUSE_INTERVAL_MS * 1000);
-        timer_start(&launcher->timer_b, RANDOM_PAUSE_TIME_MS * 1000);
+        timer_start_us(&launcher->timer_a, RANDOM_PAUSE_INTERVAL_MS * 1000);
+        timer_start_us(&launcher->timer_b, RANDOM_PAUSE_TIME_MS * 1000);
         launcher->temporary_stop = false;
         // Start audio
         uint32_t track_number = TRACK_NUMBER_UNUSED;
@@ -1181,20 +1216,20 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
             if (!launcher->temporary_stop && timer_has_expired(&launcher->timer_b)) {
                 if (esp_random() < UINT32_MAX / 2) {
                     ESP_LOGI(TAG, "random stop for %d ms.", RANDOM_PAUSE_TIME_MS);
-                    timer_start(&launcher->timer_a, RANDOM_PAUSE_TIME_MS * 1000);
+                    timer_start_us(&launcher->timer_a, RANDOM_PAUSE_TIME_MS * 1000);
                     motor_stop(launcher->motor);
                     launcher->temporary_stop = true;
                 } else {
                     ESP_LOGI(TAG, "won't stop randomly for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
                     ESP_LOGI(TAG, "step_current %d, step_target %d%.", step_current, launcher->step_target);
-                    timer_start(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
+                    timer_start_us(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
                 }
             }
             if (launcher->temporary_stop && timer_has_expired(&launcher->timer_a)) {
                 ESP_LOGI(TAG, "restarting after random stop, won't stop again for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
                 ESP_LOGI(TAG, "step_current %d, step_target %d%.", step_current, launcher->step_target);
                 motor_start(launcher->motor, launcher->direction_up_not_down, 100);
-                timer_start(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
+                timer_start_us(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
                 launcher->temporary_stop = false;
             }
         }
@@ -1203,7 +1238,7 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
         launcher->step_target = STEP_UNKNOWN;
         motor_stop(launcher->motor);
         print_step(step_current, step_ground_level);
-        timer_start(&launcher->timer_a, DANGLE_TIME_SECONDS * 1000000);
+        timer_start_us(&launcher->timer_a, DANGLE_TIME_SECONDS * 1000000);
         // Start audio
         uint32_t track_number = TRACK_NUMBER_UNUSED;
         nvs_track_number_dangling_get(&track_number);
@@ -1430,7 +1465,7 @@ static void launcher_cb(void *handle, void *arg)
 
     // Get a commanded state from the queue
     launcher_state_t commanded_state = LAUNCHER_STATE_NULL;
-    while (xQueueReceive(launcher->queue, &commanded_state, 0) == pdTRUE) {
+    while (xQueueReceive(launcher->queue_state, &commanded_state, 0) == pdTRUE) {
 
         const char *name = "UNKNOWN";
         if (commanded_state < FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name)) {
@@ -1449,7 +1484,7 @@ static void launcher_cb(void *handle, void *arg)
                 // advancement, they cannot be commanded by the user
                 ESP_LOGW(TAG, "ignoring command to enter state %s (%d).", name, commanded_state);
                 commanded_state = LAUNCHER_STATE_NULL;
-                    fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
+                fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
             break;
             case LAUNCHER_STATE_STEP_UP:
             case LAUNCHER_STATE_STEP_DOWN:
@@ -1524,7 +1559,7 @@ static void handler_launch_now(launcher_t *launcher, uint32_t unused)
 
     // Queue the command to the launcher to switch to running state
     launcher_state_t state = LAUNCHER_STATE_RUN;
-    xQueueSend(launcher->queue, &state, portMAX_DELAY);
+    xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
 }
 
 // Handle the "up" command.
@@ -1534,7 +1569,7 @@ static void handler_up(launcher_t *launcher, uint32_t unused)
 
     // Queue the command to the launcher to switch to step-up state
     launcher_state_t state = LAUNCHER_STATE_STEP_UP;
-    xQueueSend(launcher->queue, &state, portMAX_DELAY);
+    xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
 }
 
 // Handle the "down" command.
@@ -1544,7 +1579,7 @@ static void handler_down(launcher_t *launcher, uint32_t unused)
 
     // Queue the command to the launcher to switch to step-down state
     launcher_state_t state = LAUNCHER_STATE_STEP_DOWN;
-    xQueueSend(launcher->queue, &state, portMAX_DELAY);
+    xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
 }
 
 // Handle the "this is ground level" command.
@@ -1559,7 +1594,7 @@ static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused)
             retained_ram.step_ground_level = retained_ram.step_current;
             FGR_RRAM_SET(retained_ram);
         } else {
-           ESP_LOGW(TAG, "cannot set ground level as current step is unknown.");
+            ESP_LOGW(TAG, "cannot set ground level as current step is unknown.");
         }
     }
 }
@@ -1596,18 +1631,20 @@ static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused)
     nvs_random_enable_set(DEFAULT_RANDOM_ENABLE);
     nvs_mute_set(DEFAULT_MUTE);
 
-    // Set the ground level and current step to unknown
+    // Reset the auto timer directly
+    launcher->auto_period_seconds = DEFAULT_AUTO_PERIOD_SECONDS;
+    timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
+
+    // Reset the current step and set ground level to unknown
     retained_ram_t retained_ram;
     if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
-        retained_ram.step_current = STEP_UNKNOWN;
+        retained_ram.step_current = 0;
         retained_ram.step_ground_level = STEP_UNKNOWN;
         FGR_RRAM_SET(retained_ram);
     }
 
     // Set the launcher state back to NULL
     launcher->state = LAUNCHER_STATE_NULL;
-
-    // Anything else TODO?
 }
 
 // Handle the "emergency stop" command.
@@ -1617,7 +1654,7 @@ static void handler_emergency_stop(launcher_t *launcher, uint32_t unused)
 
     // Queue the command to the launcher to halt
     launcher_state_t state = LAUNCHER_STATE_HALT;
-    xQueueSend(launcher->queue, &state, portMAX_DELAY);
+    xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
 }
 
 // Handle the "play track" command.
@@ -1634,8 +1671,11 @@ static void handler_auto_enable(launcher_t *launcher, uint32_t enable)
 
     // Write the new setting to NVS
     nvs_auto_enable_set(enable ? true : false);
-
-    // Anything else TODO?
+    if (enable) {
+        // Set the timer to a short period so that the change takes effect quickly
+        launcher->auto_period_seconds = AUTO_MODE_RETRY_TIME_SECONDS;
+        timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
+    }
 }
 
 // Handle the "auto period" command.
@@ -1645,8 +1685,9 @@ static void handler_auto_period_seconds(launcher_t *launcher, uint32_t period)
 
     // Write the new setting to NVS
     nvs_auto_period_seconds_set(period);
-
-    // Anything else TODO?
+    // Reset the timer
+    launcher->auto_period_seconds = period;
+    timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
 }
 
 // Handle the "height max" command.
@@ -1656,8 +1697,6 @@ static void handler_height_max_mm(launcher_t *launcher, uint32_t height)
 
     // Write the new setting to NVS
     nvs_height_max_mm_set(height);
-
-    // Anything else TODO?
 }
 
 // Handle the "speed" command.
@@ -1667,8 +1706,6 @@ static void handler_speed_mm_per_second(launcher_t *launcher, uint32_t speed)
 
     // Write the new setting to NVS
     nvs_speed_mm_per_second_set(speed);
-
-    // Anything else TODO?
 }
 
 // Handle the "track number skittering" command.
@@ -1678,8 +1715,6 @@ static void handler_track_number_skittering(launcher_t *launcher, uint32_t track
 
     // Write the new setting to NVS
     nvs_track_number_skittering_set(track_number);
-
-    // Anything else TODO?
 }
 
 // Handle the "track number jumping" command.
@@ -1689,8 +1724,6 @@ static void handler_track_number_jumping(launcher_t *launcher, uint32_t track_nu
 
     // Write the new setting to NVS
     nvs_track_number_jumping_set(track_number);
-
-    // Anything else TODO?
 }
 
 // Handle the "track number dangling" command.
@@ -1700,8 +1733,6 @@ static void handler_track_number_dangling(launcher_t *launcher, uint32_t track_n
 
     // Write the new setting to NVS
     nvs_track_number_dangling_set(track_number);
-
-    // Anything else TODO?
 }
 
 // Handle the "track number resetting" command.
@@ -1711,8 +1742,6 @@ static void handler_track_number_resetting(launcher_t *launcher, uint32_t track_
 
     // Write the new setting to NVS
     nvs_track_number_resetting_set(track_number);
-
-    // Anything else TODO?
 }
 
 // Handle the "random enable" command.
@@ -1722,8 +1751,6 @@ static void handler_random_enable(launcher_t *launcher, uint32_t enable)
 
     // Write the new setting to NVS
     nvs_random_enable_set(enable ? true : false);
-
-    // Anything else TODO?
 }
 
 // Handle the "mute" command.
@@ -1733,8 +1760,6 @@ static void handler_mute(launcher_t *launcher, uint32_t enable)
 
     // Write the new setting to NVS
     nvs_mute_set(enable ? true : false);
-
-    // Anything else TODO?
 }
 
 /* ----------------------------------------------------------------
@@ -2115,7 +2140,7 @@ static int characteristic_track_number_dangling_cb(uint16_t conn_handle, uint16_
 
     CONTEXT_LOCK(context->lock, "characteristic_track_number_dangling_cb");
 
-    command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_JUMPING,
+    command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_DANGLING,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
         // Read the current setting
@@ -2371,7 +2396,7 @@ static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_UINT32,
                                                       .uuid = 0xFFF0,
-                                                      .name = "COMMAND_TRACK_NUMBER_RELAXING",
+                                                      .name = "COMMAND_TRACK_NUMBER_RESETTING",
                                                       .characteristic_cb = characteristic_track_number_resetting_cb,
                                                       .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
                                                       .handler = handler_track_number_resetting
@@ -2698,8 +2723,8 @@ static int32_t init(context_t *context)
                 launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
             }
         } else {
-            // Set stored position and ground level to definitively unknown
-            retained_ram.step_current = STEP_UNKNOWN;
+            // Set ground level to definitively unknown
+            retained_ram.step_current = 0;
             retained_ram.step_ground_level = STEP_UNKNOWN;
             FGR_RRAM_SET(retained_ram);
         }
@@ -2787,9 +2812,9 @@ static int32_t init(context_t *context)
             err = -ESP_ERR_NO_MEM;
             // RTOS stuff needed for launcher operation
             launcher_t *launcher = &context->launcher;
-            launcher->queue = xQueueCreate(10, sizeof(launcher_state_t));
-            if (launcher->queue) {
-                err = fgr_task_create(&launcher_cb, context, "launcher", 4096, 3, &launcher->task);
+            launcher->queue_state = xQueueCreate(10, sizeof(launcher_state_t));
+            if (launcher->queue_state) {
+                err = fgr_task_create(&launcher_cb, context, "launcher", 4096, 3, &launcher->task_state);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "unable to create launcher task (%s)!", esp_err_to_name(-err));
                 }
@@ -2810,6 +2835,13 @@ static int32_t init(context_t *context)
             } else {
                 ESP_LOGE(TAG, "unable to create command queue!");
             }
+        }
+
+        if (err == ESP_OK) {
+            // RTOS stuff needed for automatic mode
+            nvs_auto_period_seconds_get(&launcher->auto_period_seconds);
+            timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
+            err = fgr_task_create(&auto_cb, launcher, "auto", 4096, 3, &launcher->task_auto);
         }
 
         if (err == ESP_OK) {
@@ -2887,6 +2919,7 @@ static int32_t init(context_t *context)
 void app_main(void)
 {
     context_t *context = &g_context;
+    launcher_t *launcher = &context->launcher;
 
     ESP_LOGI(TAG, "app_main start");
 
@@ -2917,9 +2950,8 @@ void app_main(void)
     if (context->command_queue){
         vQueueDelete(context->command_queue);
     }
-    launcher_t *launcher = &context->launcher;
-    if (launcher->queue){
-        vQueueDelete(launcher->queue);
+    if (launcher->queue_state){
+        vQueueDelete(launcher->queue_state);
     }
     motor_brushless_deinit();
     if (context->lock) {
