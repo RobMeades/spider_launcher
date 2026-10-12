@@ -97,7 +97,7 @@
 #define SERVICE_UUID 0xFFE0
 
 // The name for the "auto enable" entry in non-volatile storage.
-#define NVS_NAME_AUTO_ENABLE "auto_enable"
+#define NVS_NAME_AUTO_ENABLE "auto_enabled"
 
 // The name for the "auto period" entry in non-volatile storage.
 #define NVS_NAME_AUTO_PERIOD_SECONDS "auto_period_sec"
@@ -129,7 +129,7 @@
 #define NVS_NAME_MUTE "mute"
 
 // The name for the "random enable" entry in non-volatile storage.
-#define NVS_NAME_RANDOM_ENABLE "random_enable"
+#define NVS_NAME_RANDOM_ENABLE "random_enabled"
 
 // Default value for "auto enable".
 #define DEFAULT_AUTO_ENABLE false
@@ -255,6 +255,22 @@ typedef enum {
     LAUNCHER_STATE_NUMBER_OF
 } launcher_state_t;
 
+// Shadow structure for NVS items: since BLE
+// _also_ write to NVS, trying to avoid
+// accessing it is a good thing to reduce contention.
+typedef struct {
+   bool auto_enabled;
+   uint32_t auto_period_seconds;
+   uint32_t height_max_mm;
+   uint32_t speed_mm_per_second;
+   uint32_t track_number_skittering;
+   uint32_t track_number_jumping;
+   uint32_t track_number_dangling;
+   uint32_t track_number_resetting;
+   bool random_enabled;
+   bool mute;
+} nvs_shadow_t;
+
 // A timer: start time and duration.
 typedef struct {
     int64_t start_us;
@@ -270,11 +286,11 @@ typedef struct {
     bool direction_up_not_down;
     launcher_timer_t timer_a;
     launcher_timer_t timer_b;
-    bool random_enable;
     bool temporary_stop;
     TaskHandle_t task_auto;
     uint32_t auto_period_seconds;
     launcher_timer_t timer_auto;
+    nvs_shadow_t nvs_shadow;
     void *motor;
 } launcher_t;
 
@@ -306,8 +322,8 @@ typedef struct {
 typedef int (*characteristic_cb_t) (uint16_t conn_handle, uint16_t attr_handle,
                                     struct ble_gatt_access_ctxt *ctxt, void *arg);
 
-// Function prototype for an command handler (which ultimate does the work).
-typedef void (*command_handler_t) (launcher_t *launcher, uint32_t value);
+// Function prototype for a command handler (which ultimate does the work).
+typedef void (*command_handler_t) (launcher_t *launcher, uint32_t value, bool read_not_write);
 
 // Properties of a command we advertise as a BLE characteristic;
 // this is the basis of g_command_data_list[], which is populated way
@@ -412,9 +428,15 @@ static int32_t nvs_auto_enable_get(bool *enable)
 }
 
 // Set whether auto is enabled or not in NVS.
-static int32_t nvs_auto_enable_set(bool enable)
+static int32_t nvs_auto_enable_set(nvs_shadow_t *nvs_shadow, bool enable)
 {
-    return fgr_nvs_set(NVS_NAME_AUTO_ENABLE, enable);
+    int32_t err = fgr_nvs_set(NVS_NAME_AUTO_ENABLE, enable);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->auto_enabled = enable;
+    }
+
+    return err;
 }
 
 // Retrieve the auto period from NVS;
@@ -434,9 +456,16 @@ static int32_t nvs_auto_period_seconds_get(uint32_t *auto_period_seconds)
 }
 
 // Set the auto period in NVS.
-static int32_t nvs_auto_period_seconds_set(uint32_t auto_period_seconds)
+static int32_t nvs_auto_period_seconds_set(nvs_shadow_t *nvs_shadow,
+                                           uint32_t auto_period_seconds)
 {
-    return fgr_nvs_set(NVS_NAME_AUTO_PERIOD_SECONDS, auto_period_seconds);
+    int32_t err = fgr_nvs_set(NVS_NAME_AUTO_PERIOD_SECONDS, auto_period_seconds);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->auto_period_seconds = auto_period_seconds;
+    }
+
+    return err;
 }
 
 // Retrieve the height max from NVS;
@@ -456,9 +485,16 @@ static int32_t nvs_height_max_mm_get(uint32_t *height_max_mm)
 }
 
 // Set the height max in NVS.
-static int32_t nvs_height_max_mm_set(uint32_t height_max_mm)
+static int32_t nvs_height_max_mm_set(nvs_shadow_t *nvs_shadow,
+                                     uint32_t height_max_mm)
 {
-    return fgr_nvs_set(NVS_NAME_HEIGHT_MAX_MM, height_max_mm);
+    int32_t err = fgr_nvs_set(NVS_NAME_HEIGHT_MAX_MM, height_max_mm);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->height_max_mm = height_max_mm;
+    }
+
+    return err;
 }
 
 // Retrieve the speed in mm per second from NVS;
@@ -478,9 +514,16 @@ static int32_t nvs_speed_mm_per_second_get(uint32_t *speed_mm_per_second)
 }
 
 // Set the speed mm per second in NVS.
-static int32_t nvs_speed_mm_per_second_set(uint32_t speed_mm_per_second)
+static int32_t nvs_speed_mm_per_second_set(nvs_shadow_t *nvs_shadow,
+                                           uint32_t speed_mm_per_second)
 {
-    return fgr_nvs_set(NVS_NAME_SPEED_MM_PER_SECOND, speed_mm_per_second);
+    int32_t err = fgr_nvs_set(NVS_NAME_SPEED_MM_PER_SECOND, speed_mm_per_second);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->speed_mm_per_second = speed_mm_per_second;
+    }
+
+    return err;
 }
 
 // Retrieve the skittering track number from NVS;
@@ -500,9 +543,16 @@ static int32_t nvs_track_number_skittering_get(uint32_t *track_number)
 }
 
 // Set the track number for skittering in NVS.
-static int32_t nvs_track_number_skittering_set(uint32_t track_number)
+static int32_t nvs_track_number_skittering_set(nvs_shadow_t *nvs_shadow,
+                                               uint32_t track_number)
 {
-    return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_SKITTERING, track_number);
+    int32_t err = fgr_nvs_set(NVS_NAME_TRACK_NUMBER_SKITTERING, track_number);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->track_number_skittering = track_number;
+    }
+
+    return err;
 }
 
 // Retrieve the jumping track number from NVS;
@@ -522,9 +572,16 @@ static int32_t nvs_track_number_jumping_get(uint32_t *track_number)
 }
 
 // Set the track number for jumping in NVS.
-static int32_t nvs_track_number_jumping_set(uint32_t track_number)
+static int32_t nvs_track_number_jumping_set(nvs_shadow_t *nvs_shadow,
+                                            uint32_t track_number)
 {
-    return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_JUMPING, track_number);
+    int32_t err = fgr_nvs_set(NVS_NAME_TRACK_NUMBER_JUMPING, track_number);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->track_number_jumping = track_number;
+    }
+
+    return err;
 }
 
 // Retrieve the dangling track number from NVS;
@@ -544,9 +601,16 @@ static int32_t nvs_track_number_dangling_get(uint32_t *track_number)
 }
 
 // Set the track number for dangling in NVS.
-static int32_t nvs_track_number_dangling_set(uint32_t track_number)
+static int32_t nvs_track_number_dangling_set(nvs_shadow_t *nvs_shadow,
+                                             uint32_t track_number)
 {
-    return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_DANGLING, track_number);
+    int32_t err = fgr_nvs_set(NVS_NAME_TRACK_NUMBER_DANGLING, track_number);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->track_number_dangling = track_number;
+    }
+
+    return err;
 }
 
 // Retrieve the jumping track resetting from NVS;
@@ -566,9 +630,16 @@ static int32_t nvs_track_number_resetting_get(uint32_t *track_number)
 }
 
 // Set the track number for resetting in NVS.
-static int32_t nvs_track_number_resetting_set(uint32_t track_number)
+static int32_t nvs_track_number_resetting_set(nvs_shadow_t *nvs_shadow,
+                                              uint32_t track_number)
 {
-    return fgr_nvs_set(NVS_NAME_TRACK_NUMBER_RESETTING, track_number);
+    int32_t err = fgr_nvs_set(NVS_NAME_TRACK_NUMBER_RESETTING, track_number);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->track_number_resetting = track_number;
+    }
+
+    return err;
 }
 
 // Retrieve whether random is enabled or not from NVS;
@@ -591,9 +662,16 @@ static int32_t nvs_random_enable_get(bool *enable)
 }
 
 // Set whether random is enabled or not in NVS.
-static int32_t nvs_random_enable_set(bool enable)
+static int32_t nvs_random_enable_set(nvs_shadow_t *nvs_shadow,
+                                     bool enable)
 {
-    return fgr_nvs_set(NVS_NAME_RANDOM_ENABLE, enable);
+    int32_t err = fgr_nvs_set(NVS_NAME_RANDOM_ENABLE, enable);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->random_enabled = enable;
+    }
+
+    return err;
 }
 
 // Retrieve whether audio muting is enabled or not from NVS;
@@ -616,13 +694,20 @@ static int32_t nvs_mute_get(bool *enable)
 }
 
 // Set whether audio muting is enabled or not in NVS.
-static int32_t nvs_mute_set(bool enable)
+static int32_t nvs_mute_set(nvs_shadow_t *nvs_shadow,
+                            bool enable)
 {
-    return fgr_nvs_set(NVS_NAME_MUTE, enable);
+    int32_t err = fgr_nvs_set(NVS_NAME_MUTE, enable);
+
+    if ((err == ESP_OK) && nvs_shadow) {
+        nvs_shadow->mute = enable;
+    }
+
+    return err;
 }
 
 // Populate NVS with defaults if required.
-static void nvs_populate()
+static void nvs_populate(nvs_shadow_t *nvs_shadow)
 {
     bool enable;
     uint32_t value;
@@ -631,35 +716,45 @@ static void nvs_populate()
     // on error, we can write that value back to set up
     // NVS when it is blank
     if (nvs_auto_enable_get(&enable) != ESP_OK) {
-        nvs_auto_enable_set(enable);
+        nvs_auto_enable_set(NULL, enable);
     }
+    nvs_shadow->auto_enabled = enable;
     if (nvs_auto_period_seconds_get(&value) != ESP_OK) {
-        nvs_auto_period_seconds_set(value);
+        nvs_auto_period_seconds_set(NULL, value);
     }
+    nvs_shadow->auto_period_seconds = value;
     if (nvs_height_max_mm_get(&value) != ESP_OK) {
-        nvs_height_max_mm_set(value);
+        nvs_height_max_mm_set(NULL, value);
     }
+    nvs_shadow->height_max_mm = value;
     if (nvs_speed_mm_per_second_get(&value) != ESP_OK) {
-        nvs_speed_mm_per_second_set(value);
+        nvs_speed_mm_per_second_set(NULL, value);
     }
+    nvs_shadow->speed_mm_per_second = value;
     if (nvs_track_number_skittering_get(&value) != ESP_OK) {
-        nvs_track_number_skittering_set(value);
+        nvs_track_number_skittering_set(NULL, value);
     }
+    nvs_shadow->track_number_skittering = value;
     if (nvs_track_number_jumping_get(&value) != ESP_OK) {
-        nvs_track_number_jumping_set(value);
+        nvs_track_number_jumping_set(NULL, value);
     }
+    nvs_shadow->track_number_jumping = value;
     if (nvs_track_number_dangling_get(&value) != ESP_OK) {
-        nvs_track_number_dangling_set(value);
+        nvs_track_number_dangling_set(NULL, value);
     }
+    nvs_shadow->track_number_dangling = value;
     if (nvs_track_number_resetting_get(&value) != ESP_OK) {
-        nvs_track_number_resetting_set(value);
+        nvs_track_number_resetting_set(NULL, value);
     }
+    nvs_shadow->track_number_resetting = value;
     if (nvs_random_enable_get(&enable) != ESP_OK) {
-        nvs_random_enable_set(enable);
+        nvs_random_enable_set(NULL, enable);
     }
+    nvs_shadow->random_enabled = enable;
     if (nvs_mute_get(&enable) != ESP_OK) {
-        nvs_mute_set(enable);
+        nvs_mute_set(NULL, enable);
     }
+    nvs_shadow->mute = enable;
 }
 
 /* ----------------------------------------------------------------
@@ -847,9 +942,9 @@ static int ble_gap_event_callback(struct ble_gap_event *event, void *arg)
 
                 // Propose connection parameters with a keep-alive
                 struct ble_gap_upd_params params;
-                params.itvl_min = 100;   // Connection interval min: 100 * 1.25ms = 125ms
-                params.itvl_max = 100;   // Connection interval max (use same value for fixed interval)
-                params.latency = 0;      // Slave latency: 0 = must respond to every connection event
+                params.itvl_min = 0x06;   // 7.5 ms (minimum)
+                params.itvl_max = 0x06;   // 7.5 ms
+                params.latency = 0;       // No slave latency
                 params.supervision_timeout = 400;  // Supervision timeout: 400 * 10ms = 4 seconds
                 params.min_ce_len = 0;
                 params.max_ce_len = 0;
@@ -1006,17 +1101,16 @@ static bool timer_has_expired(launcher_timer_t *timer)
 static void auto_cb(void *handle, void *arg)
 {
     launcher_t *launcher = (launcher_t *) arg;
-    bool auto_mode_enabled = false;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     (void) handle;
 
-    nvs_auto_enable_get(&auto_mode_enabled);
-    if (auto_mode_enabled && timer_has_expired(&launcher->timer_auto)) {
+    if (nvs_shadow->auto_enabled && timer_has_expired(&launcher->timer_auto)) {
         if (launcher->state == LAUNCHER_STATE_READY) {
             // Start the next run
             launcher_state_t state = LAUNCHER_STATE_RUN;
             xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
-            nvs_auto_period_seconds_get(&launcher->auto_period_seconds);
+            launcher->auto_period_seconds = nvs_shadow->auto_period_seconds;
             ESP_LOGI(TAG, "### Auto mode timer expired (next expiry in %d second(s)) ###",
                      launcher->auto_period_seconds);
         } else {
@@ -1041,22 +1135,16 @@ static void print_step(int32_t step_current, int32_t step_ground_level)
 
 // Start the motor speed in the given direction.
 static void motor_start(void *motor, bool direction_up_not_down,
+                        uint32_t abs_speed_mm_per_second,
                         uint32_t speed_modifier_percent)
 {
-    uint32_t abs_speed_mm_per_second;
-    int32_t err = nvs_speed_mm_per_second_get(&abs_speed_mm_per_second);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "unable to read speed from NVS (%s), using default (%d mm/s).",
-                  esp_err_to_name(-err), abs_speed_mm_per_second);
-    }
-
     int32_t speed_mm_per_second = (int32_t) abs_speed_mm_per_second * speed_modifier_percent / 100;
     if (!direction_up_not_down) {
         speed_mm_per_second = -speed_mm_per_second;
     }
 
     int32_t pwm = 100 * speed_mm_per_second / SPEED_MAX_MM_PER_SECOND;
-    err = motor_brushless_set_speed(motor, pwm);
+    int32_t err = motor_brushless_set_speed(motor, pwm);
     if (err == ESP_OK) {
          ESP_LOGI(TAG, "speed set to %d mm/s (pwm %d%%).", speed_mm_per_second, pwm);
     } else {
@@ -1091,6 +1179,7 @@ static launcher_state_t advance_state_commanded_step_up(launcher_t *launcher,
                                                         int32_t step_ground_level)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     if (step_current == STEP_UNKNOWN) {
         // Got to have some sort of reference
@@ -1100,7 +1189,8 @@ static launcher_state_t advance_state_commanded_step_up(launcher_t *launcher,
         launcher->step_target = step_current + 1;
         launcher->direction_up_not_down = true;
         ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current, launcher->step_target);
-        motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+        motor_start(launcher->motor, launcher->direction_up_not_down,
+                    nvs_shadow->speed_mm_per_second, 100);
         next_state = LAUNCHER_STATE_STEP_UP;
     } else {
         ESP_LOGW(TAG, "ignoring step up, already at limit (step %d (%d mm)).",
@@ -1116,6 +1206,7 @@ static launcher_state_t advance_state_commanded_step_down(launcher_t *launcher,
                                                           int32_t step_ground_level)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     if (step_current == STEP_UNKNOWN) {
         // Got to have some sort of reference
@@ -1125,7 +1216,8 @@ static launcher_state_t advance_state_commanded_step_down(launcher_t *launcher,
         launcher->step_target = step_current - 1;
         launcher->direction_up_not_down = false;
         ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current, launcher->step_target);
-        motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+        motor_start(launcher->motor, launcher->direction_up_not_down,
+                    nvs_shadow->speed_mm_per_second, 100);
         next_state = LAUNCHER_STATE_STEP_DOWN;
     } else {
         ESP_LOGW(TAG, "ignoring step down, at ground level already (%d).", step_ground_level);
@@ -1141,20 +1233,20 @@ static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
                                                     int32_t step_ground_level)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+
 
     if (step_current < step_max) {
         // Set up the skittering audio for a duration
-        uint32_t track_number = TRACK_NUMBER_UNUSED;
-        nvs_track_number_skittering_get(&track_number);
+        uint32_t track_number = nvs_shadow->track_number_skittering;
         int64_t duration_us = 0;
         if (track_number < FGR_UTIL_ARRAY_LENGTH(g_track_duration_ms)) {
             duration_us = g_track_duration_ms[track_number] * 1000;
         }
         timer_start_us(&launcher->timer_a, duration_us);
 
-        bool mute = false;
-        nvs_mute_get(&mute);
-        if (!mute) {
+        // Start audio
+        if (!nvs_shadow->mute) {
             audio_play_track(track_number);
         }
         ESP_LOGI(TAG, "playing skittering noise for %d second(s).", duration_us / 1000000);
@@ -1174,28 +1266,25 @@ static launcher_state_t advance_state_skittering(launcher_t *launcher,
                                                  int32_t step_ground_level)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     // Wait for the skittering time to pass
     if (timer_has_expired(&launcher->timer_a)) {
         // Prepare for randomness
-        nvs_random_enable_get(&launcher->random_enable);
         timer_start_us(&launcher->timer_a, RANDOM_PAUSE_INTERVAL_MS * 1000);
         timer_start_us(&launcher->timer_b, RANDOM_PAUSE_TIME_MS * 1000);
         launcher->temporary_stop = false;
         // Start audio
-        uint32_t track_number = TRACK_NUMBER_UNUSED;
-        nvs_track_number_jumping_get(&track_number);
-        bool mute = false;
-        nvs_mute_get(&mute);
-        if (!mute) {
-            audio_play_track(track_number);
+        if (!nvs_shadow->mute) {
+            audio_play_track(nvs_shadow->track_number_jumping);
         }
         // Start jumping
         launcher->step_target = step_max;
         launcher->direction_up_not_down = true;
         ESP_LOGI(TAG, "step_current %d, step_target %d%s.", step_current, launcher->step_target,
-                 launcher->random_enable ? " (random is enabled)" : "");
-        motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+                 nvs_shadow->random_enabled ? " (random is enabled)" : "");
+        motor_start(launcher->motor, launcher->direction_up_not_down,
+                    nvs_shadow->speed_mm_per_second, 100);
         next_state = LAUNCHER_STATE_RUNNING_JUMPING;
     }
 
@@ -1209,9 +1298,10 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
                                                       int32_t step_ground_level)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     if (step_current < launcher->step_target) {
-        if (launcher->random_enable) {
+        if (nvs_shadow->random_enabled) {
             // Stop randomly to make the rise jerky
             if (!launcher->temporary_stop && timer_has_expired(&launcher->timer_b)) {
                 if (esp_random() < UINT32_MAX / 2) {
@@ -1228,7 +1318,8 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
             if (launcher->temporary_stop && timer_has_expired(&launcher->timer_a)) {
                 ESP_LOGI(TAG, "restarting after random stop, won't stop again for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
                 ESP_LOGI(TAG, "step_current %d, step_target %d%.", step_current, launcher->step_target);
-                motor_start(launcher->motor, launcher->direction_up_not_down, 100);
+                motor_start(launcher->motor, launcher->direction_up_not_down,
+                            nvs_shadow->speed_mm_per_second, 100);
                 timer_start_us(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
                 launcher->temporary_stop = false;
             }
@@ -1240,12 +1331,8 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
         print_step(step_current, step_ground_level);
         timer_start_us(&launcher->timer_a, DANGLE_TIME_SECONDS * 1000000);
         // Start audio
-        uint32_t track_number = TRACK_NUMBER_UNUSED;
-        nvs_track_number_dangling_get(&track_number);
-        bool mute = false;
-        nvs_mute_get(&mute);
-        if (!mute) {
-            audio_play_track(track_number);
+        if (!nvs_shadow->mute) {
+            audio_play_track(nvs_shadow->track_number_dangling);
         }
         ESP_LOGI(TAG, "dangling for %d second(s).", DANGLE_TIME_SECONDS);
         next_state = LAUNCHER_STATE_RUNNING_DANGLING;
@@ -1261,23 +1348,21 @@ static launcher_state_t advance_state_running_dangling(launcher_t *launcher,
                                                        int32_t step_ground_level)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     // Wait for the dangle time to pass
     if (timer_has_expired(&launcher->timer_a)) {
         // Done.
         ESP_LOGI(TAG, "resetting.");
         // Start audio
-        uint32_t track_number = TRACK_NUMBER_UNUSED;
-        nvs_track_number_resetting_get(&track_number);
-        bool mute = false;
-        nvs_mute_get(&mute);
-        if (!mute) {
-            audio_play_track(track_number);
+        if (!nvs_shadow->mute) {
+            audio_play_track(nvs_shadow->track_number_resetting);
         }
         launcher->step_target = step_ground_level;
         launcher->direction_up_not_down = false;
         ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current, launcher->step_target);
-        motor_start(launcher->motor, launcher->direction_up_not_down, RESETTING_SPEED_MODIFIER_PERCENT);
+        motor_start(launcher->motor, launcher->direction_up_not_down,
+                    nvs_shadow->speed_mm_per_second, RESETTING_SPEED_MODIFIER_PERCENT);
         next_state = LAUNCHER_STATE_RUNNING_RESETTING;
     }
 
@@ -1310,6 +1395,8 @@ static launcher_state_t advance_state_running_resetting(launcher_t *launcher,
 // IMPORTANT: the context should be locked before this is called.
 static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t commanded_state)
 {
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+
     // Use a signed value here so that negative indicates not known
     int32_t step_current = STEP_UNKNOWN;
     int32_t step_ground_level = STEP_UNKNOWN;
@@ -1320,8 +1407,7 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
     }
     int32_t step_max = STEP_UNKNOWN;
     if (step_ground_level != STEP_UNKNOWN) {
-        uint32_t height_max_mm = 0;
-        nvs_height_max_mm_get(&height_max_mm);
+        uint32_t height_max_mm = nvs_shadow->height_max_mm;
         step_max = step_ground_level + ((int32_t) height_max_mm / QRD1114_STEP_LENGTH_MM);
     }
 
@@ -1553,9 +1639,10 @@ static void launcher_cb(void *handle, void *arg)
  * -------------------------------------------------------------- */
 
 // Handle the "launch now" command.
-static void handler_launch_now(launcher_t *launcher, uint32_t unused)
+static void handler_launch_now(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
     (void) unused;
+    (void) read_not_write;
 
     // Queue the command to the launcher to switch to running state
     launcher_state_t state = LAUNCHER_STATE_RUN;
@@ -1563,9 +1650,10 @@ static void handler_launch_now(launcher_t *launcher, uint32_t unused)
 }
 
 // Handle the "up" command.
-static void handler_up(launcher_t *launcher, uint32_t unused)
+static void handler_up(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
     (void) unused;
+    (void) read_not_write;
 
     // Queue the command to the launcher to switch to step-up state
     launcher_state_t state = LAUNCHER_STATE_STEP_UP;
@@ -1573,9 +1661,10 @@ static void handler_up(launcher_t *launcher, uint32_t unused)
 }
 
 // Handle the "down" command.
-static void handler_down(launcher_t *launcher, uint32_t unused)
+static void handler_down(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
     (void) unused;
+    (void) read_not_write;
 
     // Queue the command to the launcher to switch to step-down state
     launcher_state_t state = LAUNCHER_STATE_STEP_DOWN;
@@ -1583,9 +1672,10 @@ static void handler_down(launcher_t *launcher, uint32_t unused)
 }
 
 // Handle the "this is ground level" command.
-static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused)
+static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
     (void) unused;
+    (void) read_not_write;
 
     // Set the groud level step to the current step
     retained_ram_t retained_ram;
@@ -1600,9 +1690,12 @@ static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused)
 }
 
 // Handle the "this is height max" command.
-static void handler_this_is_height_max(launcher_t *launcher, uint32_t unused)
+static void handler_this_is_height_max(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+
     (void) unused;
+    (void) read_not_write;
 
     // Get the current height
     retained_ram_t retained_ram;
@@ -1610,26 +1703,30 @@ static void handler_this_is_height_max(launcher_t *launcher, uint32_t unused)
         (retained_ram.step_ground_level != STEP_UNKNOWN) &&
         (retained_ram.step_current != STEP_UNKNOWN)) {
         // Set the "height max" value in NVS
-        nvs_height_max_mm_set((retained_ram.step_current - retained_ram.step_ground_level) * QRD1114_STEP_LENGTH_MM);
+        nvs_height_max_mm_set(nvs_shadow,
+                              (retained_ram.step_current - retained_ram.step_ground_level) * QRD1114_STEP_LENGTH_MM);
     }
 }
 
 // Handle the "reset to defaults" command.
-static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused)
+static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
     (void) unused;
+    (void) read_not_write;
+
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     // Write the default settings to NVS
-    nvs_auto_enable_set(DEFAULT_AUTO_ENABLE);
-    nvs_auto_period_seconds_set(DEFAULT_AUTO_PERIOD_SECONDS);
-    nvs_height_max_mm_set(DEFAULT_HEIGHT_MAX_MM);
-    nvs_speed_mm_per_second_set(DEFAULT_SPEED_MM_PER_SECOND);
-    nvs_track_number_skittering_set(DEFAULT_TRACK_NUMBER_SKITTERING);
-    nvs_track_number_jumping_set(DEFAULT_TRACK_NUMBER_JUMPING);
-    nvs_track_number_dangling_set(DEFAULT_TRACK_NUMBER_DANGLING);
-    nvs_track_number_resetting_set(DEFAULT_TRACK_NUMBER_RESETTING);
-    nvs_random_enable_set(DEFAULT_RANDOM_ENABLE);
-    nvs_mute_set(DEFAULT_MUTE);
+    nvs_auto_enable_set(nvs_shadow, DEFAULT_AUTO_ENABLE);
+    nvs_auto_period_seconds_set(nvs_shadow, DEFAULT_AUTO_PERIOD_SECONDS);
+    nvs_height_max_mm_set(nvs_shadow, DEFAULT_HEIGHT_MAX_MM);
+    nvs_speed_mm_per_second_set(nvs_shadow, DEFAULT_SPEED_MM_PER_SECOND);
+    nvs_track_number_skittering_set(nvs_shadow, DEFAULT_TRACK_NUMBER_SKITTERING);
+    nvs_track_number_jumping_set(nvs_shadow, DEFAULT_TRACK_NUMBER_JUMPING);
+    nvs_track_number_dangling_set(nvs_shadow, DEFAULT_TRACK_NUMBER_DANGLING);
+    nvs_track_number_resetting_set(nvs_shadow, DEFAULT_TRACK_NUMBER_RESETTING);
+    nvs_random_enable_set(nvs_shadow, DEFAULT_RANDOM_ENABLE);
+    nvs_mute_set(nvs_shadow, DEFAULT_MUTE);
 
     // Reset the auto timer directly
     launcher->auto_period_seconds = DEFAULT_AUTO_PERIOD_SECONDS;
@@ -1648,9 +1745,10 @@ static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused)
 }
 
 // Handle the "emergency stop" command.
-static void handler_emergency_stop(launcher_t *launcher, uint32_t unused)
+static void handler_emergency_stop(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
     (void) unused;
+    (void) read_not_write;
 
     // Queue the command to the launcher to halt
     launcher_state_t state = LAUNCHER_STATE_HALT;
@@ -1658,108 +1756,111 @@ static void handler_emergency_stop(launcher_t *launcher, uint32_t unused)
 }
 
 // Handle the "play track" command.
-static void handler_play_track(launcher_t *launcher, uint32_t track_number)
+static void handler_play_track(launcher_t *launcher, uint32_t track_number, bool read_not_write)
 {
+    (void) launcher;
+    (void) read_not_write;
+
     // Play the track
     audio_play_track(track_number);
 }
 
 // Handle the "auto enable" command.
-static void handler_auto_enable(launcher_t *launcher, uint32_t enable)
+static void handler_auto_enable(launcher_t *launcher, uint32_t enable, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_auto_enable_set(enable ? true : false);
-    if (enable) {
-        // Set the timer to a short period so that the change takes effect quickly
-        launcher->auto_period_seconds = AUTO_MODE_RETRY_TIME_SECONDS;
-        timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_auto_enable_set(&launcher->nvs_shadow, enable ? true : false);
+        if (enable) {
+            // Set the timer to a short period so that the change takes effect quickly
+            launcher->auto_period_seconds = AUTO_MODE_RETRY_TIME_SECONDS;
+            timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
+        }
     }
 }
 
 // Handle the "auto period" command.
-static void handler_auto_period_seconds(launcher_t *launcher, uint32_t period)
+static void handler_auto_period_seconds(launcher_t *launcher, uint32_t period, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_auto_period_seconds_set(period);
-    // Reset the timer
-    launcher->auto_period_seconds = period;
-    timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_auto_period_seconds_set(&launcher->nvs_shadow, period);
+        // Reset the timer
+        launcher->auto_period_seconds = period;
+        timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
+    }
 }
 
 // Handle the "height max" command.
-static void handler_height_max_mm(launcher_t *launcher, uint32_t height)
+static void handler_height_max_mm(launcher_t *launcher, uint32_t height, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_height_max_mm_set(height);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_height_max_mm_set(&launcher->nvs_shadow, height);
+    }
 }
 
 // Handle the "speed" command.
-static void handler_speed_mm_per_second(launcher_t *launcher, uint32_t speed)
+static void handler_speed_mm_per_second(launcher_t *launcher, uint32_t speed, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_speed_mm_per_second_set(speed);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_speed_mm_per_second_set(&launcher->nvs_shadow, speed);
+    }
 }
 
 // Handle the "track number skittering" command.
-static void handler_track_number_skittering(launcher_t *launcher, uint32_t track_number)
+static void handler_track_number_skittering(launcher_t *launcher, uint32_t track_number, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_track_number_skittering_set(track_number);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_track_number_skittering_set(&launcher->nvs_shadow, track_number);
+    }
 }
 
 // Handle the "track number jumping" command.
-static void handler_track_number_jumping(launcher_t *launcher, uint32_t track_number)
+static void handler_track_number_jumping(launcher_t *launcher, uint32_t track_number, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_track_number_jumping_set(track_number);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_track_number_jumping_set(&launcher->nvs_shadow, track_number);
+    }
 }
 
 // Handle the "track number dangling" command.
-static void handler_track_number_dangling(launcher_t *launcher, uint32_t track_number)
+static void handler_track_number_dangling(launcher_t *launcher, uint32_t track_number, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_track_number_dangling_set(track_number);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_track_number_dangling_set(&launcher->nvs_shadow, track_number);
+    }
 }
 
 // Handle the "track number resetting" command.
-static void handler_track_number_resetting(launcher_t *launcher, uint32_t track_number)
+static void handler_track_number_resetting(launcher_t *launcher, uint32_t track_number, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_track_number_resetting_set(track_number);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_track_number_resetting_set(&launcher->nvs_shadow, track_number);
+    }
 }
 
 // Handle the "random enable" command.
-static void handler_random_enable(launcher_t *launcher, uint32_t enable)
+static void handler_random_enable(launcher_t *launcher, uint32_t enable, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_random_enable_set(enable ? true : false);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_random_enable_set(&launcher->nvs_shadow, enable ? true : false);
+    }
 }
 
 // Handle the "mute" command.
-static void handler_mute(launcher_t *launcher, uint32_t enable)
+static void handler_mute(launcher_t *launcher, uint32_t enable, bool read_not_write)
 {
-    (void) launcher;
-
-    // Write the new setting to NVS
-    nvs_mute_set(enable ? true : false);
+    if (!read_not_write) {
+        // Write the new setting to NVS
+        nvs_mute_set(&launcher->nvs_shadow, enable ? true : false);
+    }
 }
 
 /* ----------------------------------------------------------------
@@ -1777,8 +1878,8 @@ static int queue_command(uint16_t conn_handle, uint16_t attr_handle,
     switch (ctxt->op) {
         case BLE_GATT_ACCESS_OP_WRITE_CHR:
         {
-            // Queue the command (non-blocking)
-            xQueueSendFromISR(context->command_queue, command_contents, NULL);
+            // Queue the command
+            xQueueSend(context->command_queue, command_contents, portMAX_DELAY);
 
             // Send empty success response
             os_mbuf_free_chain(ctxt->om);
@@ -1788,8 +1889,8 @@ static int queue_command(uint16_t conn_handle, uint16_t attr_handle,
         break;
         case BLE_GATT_ACCESS_OP_READ_CHR:
         {
-            // Queue the command (non-blocking), purely for information
-            xQueueSendFromISR(context->command_queue, command_contents, NULL);
+            // Queue the command, purely for information
+            xQueueSend(context->command_queue, command_contents, portMAX_DELAY);
 
             // Send the value
             os_mbuf_append(ctxt->om, &command_contents->value, sizeof(command_contents->value));
@@ -1987,10 +2088,10 @@ static int characteristic_auto_enable_cb(uint16_t conn_handle, uint16_t attr_han
     command_contents_t command_contents = {.command = COMMAND_AUTO_ENABLE,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        bool reading = false;
-        nvs_auto_enable_get(&reading);
-        command_contents.value = (uint32_t) reading;
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = (uint32_t) nvs_shadow->auto_enabled;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2015,8 +2116,10 @@ static int characteristic_auto_period_seconds_cb(uint16_t conn_handle, uint16_t 
     command_contents_t command_contents = {.command = COMMAND_AUTO_PERIOD_SECONDS,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        nvs_auto_period_seconds_get(&command_contents.value);
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = nvs_shadow->auto_period_seconds;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2040,8 +2143,10 @@ static int characteristic_height_max_mm_cb(uint16_t conn_handle, uint16_t attr_h
     command_contents_t command_contents = {.command = COMMAND_HEIGHT_MAX_MM,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        nvs_height_max_mm_get(&command_contents.value);
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = nvs_shadow->height_max_mm;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2065,8 +2170,10 @@ static int characteristic_speed_mm_per_second_cb(uint16_t conn_handle, uint16_t 
     command_contents_t command_contents = {.command = COMMAND_SPEED_MM_PER_SECOND,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        nvs_speed_mm_per_second_get(&command_contents.value);
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = nvs_shadow->speed_mm_per_second;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2093,8 +2200,10 @@ static int characteristic_track_number_skittering_cb(uint16_t conn_handle, uint1
     command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_SKITTERING,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        nvs_track_number_skittering_get(&command_contents.value);
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = nvs_shadow->track_number_skittering;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2118,8 +2227,10 @@ static int characteristic_track_number_jumping_cb(uint16_t conn_handle, uint16_t
     command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_JUMPING,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        nvs_track_number_jumping_get(&command_contents.value);
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = nvs_shadow->track_number_jumping;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2143,8 +2254,10 @@ static int characteristic_track_number_dangling_cb(uint16_t conn_handle, uint16_
     command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_DANGLING,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        nvs_track_number_dangling_get(&command_contents.value);
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = nvs_shadow->track_number_dangling;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2168,8 +2281,10 @@ static int characteristic_track_number_resetting_cb(uint16_t conn_handle, uint16
     command_contents_t command_contents = {.command = COMMAND_TRACK_NUMBER_RESETTING,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        nvs_track_number_resetting_get(&command_contents.value);
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = nvs_shadow->track_number_resetting;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2193,10 +2308,10 @@ static int characteristic_random_enable_cb(uint16_t conn_handle, uint16_t attr_h
     command_contents_t command_contents = {.command = COMMAND_RANDOM_ENABLE,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        bool reading = false;
-        nvs_random_enable_get(&reading);
-        command_contents.value = (uint32_t) reading;
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = (uint32_t) nvs_shadow->random_enabled;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2220,10 +2335,10 @@ static int characteristic_mute_cb(uint16_t conn_handle, uint16_t attr_handle,
     command_contents_t command_contents = {.command = COMMAND_MUTE,
                                            .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
     if (command_contents.read_not_write) {
-        // Read the current setting
-        bool reading = false;
-        nvs_mute_get(&reading);
-        command_contents.value = (uint32_t) reading;
+        // Read the current setting from the shadow
+        launcher_t *launcher = &context->launcher;
+        nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
+        command_contents.value = (uint32_t) nvs_shadow->mute;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2293,56 +2408,56 @@ static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE
                                                       .uuid = 0xFFE1,
                                                       .name = "LAUNCH_NOW",
                                                       .characteristic_cb = characteristic_launch_now_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                       .handler = handler_launch_now
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE2,
                                                       .name = "UP",
                                                       .characteristic_cb = characteristic_up_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                       .handler = handler_up
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE3,
                                                       .name = "DOWN",
                                                       .characteristic_cb = characteristic_down_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                       .handler = handler_down
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE4,
                                                       .name = "THIS_IS_GROUND_LEVEL",
                                                       .characteristic_cb = characteristic_this_is_ground_level_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                      .handler = handler_this_is_ground_level
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE5,
                                                       .name = "THIS_IS_HEIGHT_MAX",
                                                       .characteristic_cb = characteristic_this_is_height_max_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                       .handler = handler_this_is_height_max
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE6,
                                                       .name = "RESET_TO_DEFAULTS",
                                                       .characteristic_cb = characteristic_reset_to_defaults_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                       .handler = handler_reset_to_defaults
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
                                                       .uuid = 0xFFE7,
                                                       .name = "EMERGENCY_STOP",
                                                       .characteristic_cb = characteristic_emergency_stop_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                       .handler = handler_emergency_stop
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_UINT32,
                                                       .uuid = 0xFFE8,
                                                       .name = "PLAY TRACK",
                                                       .characteristic_cb = characteristic_play_track_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE,
+                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                       .handler = handler_play_track
                                                      },
                                                      {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
@@ -2648,7 +2763,7 @@ static void command_cb(void *handle, void *arg)
 
             // Call the command handler
             if (handler) {
-                handler(&context->launcher, value);
+                handler(&context->launcher, value, command_contents.read_not_write);
             }
 
         } else {
@@ -2695,6 +2810,7 @@ static void motor_callback(void *motor, void *param)
 static int32_t init(context_t *context)
 {
     launcher_t *launcher = &context->launcher;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     // Allow us to feed the watchdog
     esp_task_wdt_add(NULL);
@@ -2805,7 +2921,7 @@ static int32_t init(context_t *context)
 
         // Make sure that NVS is populated (in case it is blank)
         if (err == ESP_OK) {
-            nvs_populate();
+            nvs_populate(nvs_shadow);
         }
 
         if (err == ESP_OK) {
@@ -2838,8 +2954,8 @@ static int32_t init(context_t *context)
         }
 
         if (err == ESP_OK) {
-            // RTOS stuff needed for automatic mode
-            nvs_auto_period_seconds_get(&launcher->auto_period_seconds);
+            // Stuff needed for automatic mode
+            launcher->auto_period_seconds = nvs_shadow->auto_period_seconds;
             timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
             err = fgr_task_create(&auto_cb, launcher, "auto", 4096, 3, &launcher->task_auto);
         }
@@ -2920,6 +3036,7 @@ void app_main(void)
 {
     context_t *context = &g_context;
     launcher_t *launcher = &context->launcher;
+    nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     ESP_LOGI(TAG, "app_main start");
 
@@ -2927,9 +3044,7 @@ void app_main(void)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "initialization complete.");
         ESP_LOGI(TAG, "waiting for BLE connections/commands.");
-        bool mute = false;
-        nvs_mute_get(&mute);
-        if (mute) {
+        if (nvs_shadow->mute) {
             ESP_LOGI(TAG, "muted, not playing any audio.");
         }
         while (1) {
