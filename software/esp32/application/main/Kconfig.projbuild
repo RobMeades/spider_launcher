@@ -35,7 +35,7 @@ menu "Application Configuration"
         depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help
             GPIO pin wired to pin IO0 of the DY-HV8F audio board,
-            if all SPIDER_LAUNCHER_UART_BAUD_RATE is set.
+            used if SPIDER_LAUNCHER_UART_NUM is -1.
 
     config SPIDER_LAUNCHER_AUDIO_PIN_1
         int "Audio pin 1"
@@ -43,7 +43,7 @@ menu "Application Configuration"
         depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help
             GPIO pin wired to pin IO1 of the DY-HV8F audio board,
-            if all SPIDER_LAUNCHER_UART_BAUD_RATE is set.
+            used if SPIDER_LAUNCHER_UART_NUM is -1.
 
     config SPIDER_LAUNCHER_AUDIO_PIN_2
         int "Audio pin 2"
@@ -51,7 +51,7 @@ menu "Application Configuration"
         depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help
             GPIO pin wired to pin IO2 of the DY-HV8F audio board,
-            if all SPIDER_LAUNCHER_UART_BAUD_RATE is set.
+            used if SPIDER_LAUNCHER_UART_NUM is -1.
 
     config SPIDER_LAUNCHER_AUDIO_PIN_3
         int "Audio pin 3"
@@ -59,7 +59,7 @@ menu "Application Configuration"
         depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help
             GPIO pin wired to pin IO3 of the DY-HV8F audio board,
-            if all SPIDER_LAUNCHER_UART_BAUD_RATE is set.
+            used if SPIDER_LAUNCHER_UART_NUM is -1.
 
     config SPIDER_LAUNCHER_AUDIO_UART_TXD_PIN
         int "Audio TXD pin"

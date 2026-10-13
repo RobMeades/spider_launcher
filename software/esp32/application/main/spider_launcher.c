@@ -84,6 +84,10 @@
  // Logging prefix.
  #define TAG "spider_launcher"
 
+// The version of the BLE interface: increment this if there is a
+// breaking change to the BLE characteristic handling.
+#define BLE_INTERFACE_VERSION 0
+
 // UART buffer.
 #define UART_RX_BUFFFER_SIZE 256
 
@@ -1867,6 +1871,13 @@ static void handler_mute(launcher_t *launcher, uint32_t enable, bool read_not_wr
  * STATIC FUNCTIONS: CHARACTERISTICS CALLBACKS (CALLED BY BLE)
  * -------------------------------------------------------------- */
 
+// ##################################################################
+// The characteristic callbacks here are for BLE_INTERFACE_VERSION 0.
+// Should any breaking changes be made, please incrememnt the version
+// number and make any accompanyying changes in the Android
+// application.
+// ##################################################################
+
 // Send a command received over BLE to the command queue.
 // IMPORTANT: the context should be locked before this is called.
 static int queue_command(uint16_t conn_handle, uint16_t attr_handle,
@@ -2401,6 +2412,13 @@ static int characteristic_height_current_mm_cb(uint16_t conn_handle, uint16_t at
 /* ----------------------------------------------------------------
  * VARIABLES FOR COMMAND_HANDLING
  * -------------------------------------------------------------- */
+
+// ##################################################################
+// The characteristics here are for BLE_INTERFACE_VERSION 0.
+// Should any breaking changes be made, please incrememnt the version
+// number and make any accompanyying changes in the Android
+// application.
+// ##################################################################
 
 // Entries are in the same order as command_t, must
 // have the same number of entries as command_t.
