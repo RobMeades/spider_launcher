@@ -16,6 +16,11 @@
 
 /* This written by Google Gemini from my prompts. */
 
+// ######################################################################
+// This Android application works with ESP32 app BLE_INTERFACE_VERSION 0,
+// see the ESP-IDF application in file spider_launcher.c for details.
+// ######################################################################
+
 package com.example.spider_launcher
 
 import android.Manifest

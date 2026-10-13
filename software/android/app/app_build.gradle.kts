@@ -32,6 +32,20 @@ android {
     buildFeatures {
         compose = true
     }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("release")
+        }
+    }
 }
 
 dependencies {
