@@ -86,7 +86,7 @@
 
 // The version of the BLE interface: increment this if there is a
 // breaking change to the BLE characteristic handling.
-#define BLE_INTERFACE_VERSION 0
+#define BLE_INTERFACE_VERSION 1
 
 // UART buffer.
 #define UART_RX_BUFFFER_SIZE 256
@@ -198,8 +198,16 @@
 // the audio board in IO mode.
 #define AUDIO_IO_WAIT_TIME_MS 100
 
-// Retry time for auto mode if it was unable to run
+// Retry time for auto mode if it was unable to run.
 #define AUTO_MODE_RETRY_TIME_SECONDS 5
+
+// Defaults for the retained_ram_t structure.
+#define DEFAULTS_RETAINED_RAM {.step_current = STEP_UNKNOWN,             \
+                               .step_ground_level = STEP_UNKNOWN,        \
+                               .emergency_stopped = false}
+
+// The colour for the debug LED if we are emergency stopped.
+#define DEBUG_LED_COLOUR_EMERGENCY_STOPPED FGR_WS2812_LED_COLOUR_WHITE
 
 /* ----------------------------------------------------------------
  * TYPES
@@ -224,7 +232,7 @@ typedef enum {
     COMMAND_THIS_IS_GROUND_LEVEL,    // write only, has no value
     COMMAND_THIS_IS_HEIGHT_MAX,      // write only, has no value
     COMMAND_RESET_TO_DEFAULTS,       // write only, has no value
-    COMMAND_EMERGENCY_STOP,          // write only, has no value
+    COMMAND_EMERGENCY_STOP_ENABLE,   // read/write, Boolean
     COMMAND_PLAY_TRACK,              // write only, uint32_t
     COMMAND_AUTO_ENABLE,             // read/write, Boolean
     COMMAND_AUTO_PERIOD_SECONDS,     // read/write, uint32_t
@@ -316,10 +324,12 @@ typedef struct {
     bool read_not_write;
 } command_contents_t;
 
-// Retained RAM storage.
+// Retained RAM storage.  If you update this structure, you
+// also need to update DEFAULTS_RETAINED_RAM above.
 typedef struct {
     int32_t step_ground_level;
     int32_t step_current;
+    bool emergency_stopped;
 } retained_ram_t;
 
 // Function prototype for a characteristic callback (which BLE calls).
@@ -383,7 +393,7 @@ _Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name) == LAUNCHER_STATE_N
                 "the number of g_launcher_state_name[] entries does not match the number of launcher states!");
 
 // Table of launcher states to LED colours
-static const fgr_ws2812_colour_t g_launcher_state_colour[] = {FGR_WS2812_LED_COLOUR_WHITE,      // NULL
+static const fgr_ws2812_colour_t g_launcher_state_colour[] = {FGR_WS2812_LED_COLOUR_WHITE,       // NULL
                                                               FGR_WS2812_LED_COLOUR_CYAN,       // HEIGHT_UNKNOWN
                                                               FGR_WS2812_LED_COLOUR_GREEN,      // READY
                                                               FGR_WS2812_LED_COLOUR_YELLOW,     // STEP_UP
@@ -393,7 +403,7 @@ static const fgr_ws2812_colour_t g_launcher_state_colour[] = {FGR_WS2812_LED_COL
                                                               FGR_WS2812_LED_COLOUR_MAGENTA,    // RUNNING_JUMPING
                                                               FGR_WS2812_LED_COLOUR_MAGENTA,    // RUNNING_DANGLING
                                                               FGR_WS2812_LED_COLOUR_MAGENTA,    // RUNNING_RESETTING
-                                                              FGR_WS2812_LED_COLOUR_NONE};     // HALT
+                                                              FGR_WS2812_LED_COLOUR_NONE};    // HALT
 
 // Do some checking
 _Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_colour) == LAUNCHER_STATE_NUMBER_OF,
@@ -1169,10 +1179,14 @@ static void motor_stop(void *motor)
 }
 
 // Set the LED breathe colour according to its new state
-static void set_led_breathe_colour(launcher_state_t state)
+static void set_led_breathe_colour(launcher_state_t state, bool emergency_stopped)
 {
-    if (state < FGR_UTIL_ARRAY_LENGTH((g_launcher_state_colour))) {
-        fgr_debug_led_breathe_set(g_launcher_state_colour[state]);
+    if (emergency_stopped) {
+        fgr_debug_led_breathe_set(DEBUG_LED_COLOUR_EMERGENCY_STOPPED);
+    } else {
+        if (state < FGR_UTIL_ARRAY_LENGTH((g_launcher_state_colour))) {
+            fgr_debug_led_breathe_set(g_launcher_state_colour[state]);
+        }
     }
 }
 
@@ -1397,17 +1411,17 @@ static launcher_state_t advance_state_running_resetting(launcher_t *launcher,
 // This function _returns_ the next state, it does not change the
 // current state, it is up to the caller to do that.
 // IMPORTANT: the context should be locked before this is called.
-static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t commanded_state)
+static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t commanded_state,
+                                      retained_ram_t *retained_ram)
 {
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     // Use a signed value here so that negative indicates not known
     int32_t step_current = STEP_UNKNOWN;
     int32_t step_ground_level = STEP_UNKNOWN;
-    retained_ram_t retained_ram;
-    if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
-        step_current = (int32_t) retained_ram.step_current;
-        step_ground_level = (int32_t) retained_ram.step_ground_level;
+    if (retained_ram) {
+        step_current = (int32_t) retained_ram->step_current;
+        step_ground_level = (int32_t) retained_ram->step_ground_level;
     }
     int32_t step_max = STEP_UNKNOWN;
     if (step_ground_level != STEP_UNKNOWN) {
@@ -1436,21 +1450,21 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                     switch (commanded_state) {
                         case LAUNCHER_STATE_STEP_UP:
                             next_state = advance_state_commanded_step_up(launcher,
-                                                                         step_current,
-                                                                         STEP_UNKNOWN,
-                                                                         step_ground_level);
+                                                                        step_current,
+                                                                        STEP_UNKNOWN,
+                                                                        step_ground_level);
                         break;
                         case LAUNCHER_STATE_STEP_DOWN:
                             next_state = advance_state_commanded_step_down(launcher,
-                                                                           step_current,
-                                                                           step_ground_level);
+                                                                        step_current,
+                                                                        step_ground_level);
                         break;
                         case LAUNCHER_STATE_NULL:
                             // Nothing to do
                         break;
                         default:
                             ESP_LOGW(TAG, "ignoring command to enter state %d from state %d.",
-                                     commanded_state, launcher->state);
+                                    commanded_state, launcher->state);
                         break;
                     }
                 }
@@ -1460,14 +1474,14 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                 switch (commanded_state) {
                     case LAUNCHER_STATE_STEP_UP:
                         next_state = advance_state_commanded_step_up(launcher,
-                                                                     step_current,
-                                                                     step_max,
-                                                                     step_ground_level);
+                                                                    step_current,
+                                                                    step_max,
+                                                                    step_ground_level);
                     break;
                     case LAUNCHER_STATE_STEP_DOWN:
                         next_state = advance_state_commanded_step_down(launcher,
-                                                                       step_current,
-                                                                       step_ground_level);
+                                                                    step_current,
+                                                                    step_ground_level);
                     break;
                     case LAUNCHER_STATE_RUN:
                         // Run away
@@ -1478,11 +1492,21 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                     break;
                     default:
                         ESP_LOGW(TAG, "ignoring command to enter state %d from state %d.",
-                                 commanded_state, launcher->state);
+                                commanded_state, launcher->state);
                     break;
                 }
             break;
             case LAUNCHER_STATE_STEP_UP:
+                if (commanded_state == LAUNCHER_STATE_STEP_UP) {
+                    // We've had another step, increase the target
+                    if ((step_max == STEP_UNKNOWN) || (step_current + 1 < step_max)) {
+                        launcher->step_target++;
+                    } else {
+                        ESP_LOGW(TAG, "ignoring repeated step up, would be at limit (step %d (%d mm)).",
+                                launcher->step_target,
+                                (step_ground_level - launcher->step_target) * QRD1114_STEP_LENGTH_MM);
+                    }
+                }
                 if ((step_current != STEP_UNKNOWN) && (step_current >= launcher->step_target)) {
                     // Done.
                     launcher->step_target = STEP_UNKNOWN;
@@ -1492,6 +1516,14 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                 }
             break;
             case LAUNCHER_STATE_STEP_DOWN:
+                if (commanded_state == LAUNCHER_STATE_STEP_DOWN) {
+                    // We've had another step down, decrement the target
+                    if ((step_ground_level == STEP_UNKNOWN) || (launcher->step_target - 1 > step_ground_level)) {
+                        launcher->step_target--;
+                    } else {
+                        ESP_LOGW(TAG, "ignoring repeated step down, would be below ground level.");
+                    }
+                }
                 if ((step_current != STEP_UNKNOWN) && (step_current <= launcher->step_target)) {
                     // Done.
                     launcher->step_target = STEP_UNKNOWN;
@@ -1502,21 +1534,21 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
             break;
             case LAUNCHER_STATE_RUN:
                 next_state = advance_state_commanded_run(launcher,
-                                                         step_current,
-                                                         step_max,
-                                                         step_ground_level);
+                                                        step_current,
+                                                        step_max,
+                                                        step_ground_level);
             break;
             case LAUNCHER_STATE_RUNNING_SKITTERING:
                 next_state = advance_state_skittering(launcher,
-                                                      step_current,
-                                                      step_max,
-                                                      step_ground_level);
+                                                    step_current,
+                                                    step_max,
+                                                    step_ground_level);
             break;
             case LAUNCHER_STATE_RUNNING_JUMPING:
                 next_state = advance_state_running_jumping(launcher,
-                                                           step_current,
-                                                           step_max,
-                                                           step_ground_level);
+                                                        step_current,
+                                                        step_max,
+                                                        step_ground_level);
             break;
             case LAUNCHER_STATE_RUNNING_DANGLING:
                 next_state = advance_state_running_dangling(launcher,
@@ -1553,6 +1585,12 @@ static void launcher_cb(void *handle, void *arg)
 
     CONTEXT_LOCK(context->lock, "launcher_cb");
 
+    bool emergency_stopped = false;
+    retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
+    if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+        emergency_stopped = retained_ram.emergency_stopped;
+    }
+
     // Get a commanded state from the queue
     launcher_state_t commanded_state = LAUNCHER_STATE_NULL;
     while (xQueueReceive(launcher->queue_state, &commanded_state, 0) == pdTRUE) {
@@ -1562,76 +1600,86 @@ static void launcher_cb(void *handle, void *arg)
             name = g_launcher_state_name[commanded_state];
         }
 
-        // Check if the commanded state is allowed
-        switch (commanded_state) {
-            case LAUNCHER_STATE_NULL:
-            case LAUNCHER_STATE_HEIGHT_UNKNOWN:
-            case LAUNCHER_STATE_READY:
-            case LAUNCHER_STATE_RUNNING_SKITTERING:
-            case LAUNCHER_STATE_RUNNING_JUMPING:
-            case LAUNCHER_STATE_RUNNING_RESETTING:
-                // These states can only be entered through internal
-                // advancement, they cannot be commanded by the user
-                ESP_LOGW(TAG, "ignoring command to enter state %s (%d).", name, commanded_state);
-                commanded_state = LAUNCHER_STATE_NULL;
-                fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
-            break;
-            case LAUNCHER_STATE_STEP_UP:
-            case LAUNCHER_STATE_STEP_DOWN:
-                // Can do these if we don't know our height or are ready
-                if ((launcher->state == LAUNCHER_STATE_READY) ||
-                    (launcher->state == LAUNCHER_STATE_HEIGHT_UNKNOWN)) {
-                    ESP_LOGI(TAG, "starting %s.", name);
-                } else {
-                    ESP_LOGW(TAG, "cannot get to state %s from state %s (only from states %s and %s).",
-                             name, g_launcher_state_name[launcher->state],
-                             g_launcher_state_name[LAUNCHER_STATE_HEIGHT_UNKNOWN],
-                             g_launcher_state_name[LAUNCHER_STATE_READY]);
+        if (!emergency_stopped || (commanded_state == LAUNCHER_STATE_HALT)) {
+            // Check if the commanded state is allowed
+            switch (commanded_state) {
+                case LAUNCHER_STATE_NULL:
+                case LAUNCHER_STATE_HEIGHT_UNKNOWN:
+                case LAUNCHER_STATE_READY:
+                case LAUNCHER_STATE_RUNNING_SKITTERING:
+                case LAUNCHER_STATE_RUNNING_JUMPING:
+                case LAUNCHER_STATE_RUNNING_RESETTING:
+                    // These states can only be entered through internal
+                    // advancement, they cannot be commanded by the user
+                    ESP_LOGW(TAG, "ignoring command to enter state %s (%d).", name, commanded_state);
                     commanded_state = LAUNCHER_STATE_NULL;
                     fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
-                }
-            break;
-            case LAUNCHER_STATE_RUN:
-                // Can only do this  if we're ready
-                if (launcher->state == LAUNCHER_STATE_READY) {
-                    ESP_LOGI(TAG, "starting %s.", name);
-                } else {
-                    ESP_LOGW(TAG, "cannot get to state %s from state %s (only from state %s).",
-                             name, g_launcher_state_name[launcher->state],
-                             g_launcher_state_name[LAUNCHER_STATE_READY]);
+                break;
+                case LAUNCHER_STATE_STEP_UP:
+                case LAUNCHER_STATE_STEP_DOWN:
+                    // Can do these if we don't know our height or are ready
+                    if ((launcher->state == LAUNCHER_STATE_READY) ||
+                        (launcher->state == LAUNCHER_STATE_HEIGHT_UNKNOWN)) {
+                        ESP_LOGI(TAG, "starting %s.", name);
+                    } else {
+                        // Can also do these again if we were already doing them
+                        if (launcher->state == commanded_state) {
+                            ESP_LOGI(TAG, "continuing %s.", name);
+                        } else {
+                            ESP_LOGW(TAG, "cannot get to state %s from state %s (only from states %s and %s).",
+                                    name, g_launcher_state_name[launcher->state],
+                                    g_launcher_state_name[LAUNCHER_STATE_HEIGHT_UNKNOWN],
+                                    g_launcher_state_name[LAUNCHER_STATE_READY]);
+                            commanded_state = LAUNCHER_STATE_NULL;
+                            fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
+                        }
+                    }
+                break;
+                case LAUNCHER_STATE_RUN:
+                    // Can only do this  if we're ready
+                    if (launcher->state == LAUNCHER_STATE_READY) {
+                        ESP_LOGI(TAG, "starting %s.", name);
+                    } else {
+                        ESP_LOGW(TAG, "cannot get to state %s from state %s (only from state %s).",
+                                name, g_launcher_state_name[launcher->state],
+                                g_launcher_state_name[LAUNCHER_STATE_READY]);
+                        commanded_state = LAUNCHER_STATE_NULL;
+                        fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
+                    }
+                break;
+                case LAUNCHER_STATE_HALT:
+                    // Always handle this
+                    ESP_LOGI(TAG, "received %s.", name);
+                break;
+                default:
+                    ESP_LOGE(TAG, "commanded to enter unknown state (%d)!", commanded_state);
                     commanded_state = LAUNCHER_STATE_NULL;
                     fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
-                }
-            break;
-            case LAUNCHER_STATE_HALT:
-                 // Always handle this
-                ESP_LOGI(TAG, "received %s.", name);
-            break;
-            default:
-                ESP_LOGE(TAG, "commanded to enter unknown state (%d)!", commanded_state);
-                commanded_state = LAUNCHER_STATE_NULL;
-                fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
-            break;
+                break;
+            }
+        } else {
+            ESP_LOGI(TAG, "ignoring command to enter state %s as we are emergency stopped.", name);
+            commanded_state = LAUNCHER_STATE_NULL;
+            fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
         }
-
         if (commanded_state != LAUNCHER_STATE_NULL) {
             // Move state on based on internal events or the new commanded_state
-            launcher_state_t next_state = advance_state(launcher, commanded_state);
+            launcher_state_t next_state = advance_state(launcher, commanded_state, &retained_ram);
             if (next_state != LAUNCHER_STATE_NULL) {
                 ESP_LOGI(TAG, "state transition due to commanded state %s, %s -> %s.", name,
                          g_launcher_state_name[launcher->state], g_launcher_state_name[next_state]);
-                set_led_breathe_colour(next_state);
+                set_led_breathe_colour(next_state, emergency_stopped);
                 launcher->state = next_state;
             }
         }
     }
 
     // Make sure we advance state at least once in case there are any internal changes
-    launcher_state_t next_state = advance_state(launcher, LAUNCHER_STATE_NULL);
+    launcher_state_t next_state = advance_state(launcher, LAUNCHER_STATE_NULL, &retained_ram);
     if (next_state != LAUNCHER_STATE_NULL) {
         ESP_LOGI(TAG, "internal state transition %s -> %s.",
                  g_launcher_state_name[launcher->state], g_launcher_state_name[next_state]);
-        set_led_breathe_colour(next_state);
+        set_led_breathe_colour(next_state, emergency_stopped);
         launcher->state = next_state;
     }
 
@@ -1682,7 +1730,7 @@ static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused, 
     (void) read_not_write;
 
     // Set the groud level step to the current step
-    retained_ram_t retained_ram;
+    retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
     if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
         if (retained_ram.step_current != STEP_UNKNOWN) {
             retained_ram.step_ground_level = retained_ram.step_current;
@@ -1702,7 +1750,7 @@ static void handler_this_is_height_max(launcher_t *launcher, uint32_t unused, bo
     (void) read_not_write;
 
     // Get the current height
-    retained_ram_t retained_ram;
+    retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
     if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
         (retained_ram.step_ground_level != STEP_UNKNOWN) &&
         (retained_ram.step_current != STEP_UNKNOWN)) {
@@ -1737,7 +1785,8 @@ static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused, boo
     timer_start_us(&launcher->timer_auto, ((int64_t) launcher->auto_period_seconds) * 1000000);
 
     // Reset the current step and set ground level to unknown
-    retained_ram_t retained_ram;
+    // but leave emergency stopped alone
+    retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
     if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
         retained_ram.step_current = 0;
         retained_ram.step_ground_level = STEP_UNKNOWN;
@@ -1748,15 +1797,27 @@ static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused, boo
     launcher->state = LAUNCHER_STATE_NULL;
 }
 
-// Handle the "emergency stop" command.
-static void handler_emergency_stop(launcher_t *launcher, uint32_t unused, bool read_not_write)
+// Handle the "emergency stop enable" command.
+static void handler_emergency_stop_enable(launcher_t *launcher, uint32_t enable, bool read_not_write)
 {
-    (void) unused;
-    (void) read_not_write;
-
-    // Queue the command to the launcher to halt
-    launcher_state_t state = LAUNCHER_STATE_HALT;
-    xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
+    // Set the state in retained RAM
+    retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
+    bool previous_stopped_state = false;
+    if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
+        previous_stopped_state = retained_ram.emergency_stopped;
+        retained_ram.emergency_stopped = enable;
+        FGR_RRAM_SET(retained_ram);
+    }
+    // Either kick the state machine back into life or halt it
+    if (enable) {
+        launcher_state_t state = LAUNCHER_STATE_HALT;
+        xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
+    } else {
+        if (previous_stopped_state == true) {
+            // Directly set the launcher back into NULL state
+            launcher->state = LAUNCHER_STATE_NULL;
+        }
+}
 }
 
 // Handle the "play track" command.
@@ -1872,7 +1933,7 @@ static void handler_mute(launcher_t *launcher, uint32_t enable, bool read_not_wr
  * -------------------------------------------------------------- */
 
 // ##################################################################
-// The characteristic callbacks here are for BLE_INTERFACE_VERSION 0.
+// The characteristic callbacks here are for BLE_INTERFACE_VERSION 1.
 // Should any breaking changes be made, please incrememnt the version
 // number and make any accompanyying changes in the Android
 // application.
@@ -2047,21 +2108,30 @@ static int characteristic_reset_to_defaults_cb(uint16_t conn_handle, uint16_t at
     return return_code;
 }
 
-// "Emergency stop" characteristic callback.
-static int characteristic_emergency_stop_cb(uint16_t conn_handle, uint16_t attr_handle,
-                                            struct ble_gatt_access_ctxt *ctxt, void *arg)
+// "Emergency stop enable" characteristic callback.
+static int characteristic_emergency_stop_enable_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     int return_code = BLE_ATT_ERR_UNLIKELY;
     context_t *context = (context_t *) arg;
 
-    CONTEXT_LOCK(context->lock, "characteristic_emergency_stop_cb");
+    CONTEXT_LOCK(context->lock, "characteristic_emergency_stop_enable_cb");
 
-    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        command_contents_t command_contents = {.command = COMMAND_EMERGENCY_STOP};
-        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+    command_contents_t command_contents = {.command = COMMAND_EMERGENCY_STOP_ENABLE,
+                                           .read_not_write = (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR)};
+    if (command_contents.read_not_write) {
+        // Read the current setting from retained RAM
+        retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
+        FGR_RRAM_GET(retained_ram);
+        command_contents.value = retained_ram.emergency_stopped ? 1 : 0;
+    } else {
+        // Read the value sent with the BLE command
+        command_contents.value = mbuf_read(ctxt->om);
     }
 
-    CONTEXT_UNLOCK(context->lock, "characteristic_emergency_stop_cb");
+    return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
+
+    CONTEXT_UNLOCK(context->lock, "characteristic_emergency_stop_enable_cb");
 
     return return_code;
 }
@@ -2102,7 +2172,7 @@ static int characteristic_auto_enable_cb(uint16_t conn_handle, uint16_t attr_han
         // Read the current setting from the shadow
         launcher_t *launcher = &context->launcher;
         nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
-        command_contents.value = (uint32_t) nvs_shadow->auto_enabled;
+        command_contents.value = nvs_shadow->auto_enabled ? 1 : 0;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2322,7 +2392,7 @@ static int characteristic_random_enable_cb(uint16_t conn_handle, uint16_t attr_h
         // Read the current setting from the shadow
         launcher_t *launcher = &context->launcher;
         nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
-        command_contents.value = (uint32_t) nvs_shadow->random_enabled;
+        command_contents.value = nvs_shadow->random_enabled ? 1 : 0;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2349,7 +2419,7 @@ static int characteristic_mute_cb(uint16_t conn_handle, uint16_t attr_handle,
         // Read the current setting from the shadow
         launcher_t *launcher = &context->launcher;
         nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
-        command_contents.value = (uint32_t) nvs_shadow->mute;
+        command_contents.value = nvs_shadow->mute ? 1 : 0;
     } else {
         // Read the value sent with the BLE command
         command_contents.value = mbuf_read(ctxt->om);
@@ -2394,7 +2464,7 @@ static int characteristic_height_current_mm_cb(uint16_t conn_handle, uint16_t at
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         command_contents_t command_contents = {.command = COMMAND_HEIGHT_CURRENT_MM,
                                                .value = (uint32_t) -1};
-        retained_ram_t retained_ram;
+        retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
         if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
             (retained_ram.step_ground_level != STEP_UNKNOWN) &&
             (retained_ram.step_current != STEP_UNKNOWN)) {
@@ -2414,7 +2484,7 @@ static int characteristic_height_current_mm_cb(uint16_t conn_handle, uint16_t at
  * -------------------------------------------------------------- */
 
 // ##################################################################
-// The characteristics here are for BLE_INTERFACE_VERSION 0.
+// The characteristics here are for BLE_INTERFACE_VERSION 1.
 // Should any breaking changes be made, please incrememnt the version
 // number and make any accompanyying changes in the Android
 // application.
@@ -2464,12 +2534,12 @@ static const command_data_t g_command_data_list[] = {{.type = COMMAND_TYPE_WRITE
                                                       .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
                                                       .handler = handler_reset_to_defaults
                                                      },
-                                                     {.type = COMMAND_TYPE_WRITE_ONLY_NO_VALUE,
+                                                     {.type = COMMAND_TYPE_READ_WRITE_BOOLEAN,
                                                       .uuid = 0xFFE7,
-                                                      .name = "EMERGENCY_STOP",
-                                                      .characteristic_cb = characteristic_emergency_stop_cb,
-                                                      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
-                                                      .handler = handler_emergency_stop
+                                                      .name = "EMERGENCY_STOP_ENABLE",
+                                                      .characteristic_cb = characteristic_emergency_stop_enable_cb,
+                                                      .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+                                                      .handler = handler_emergency_stop_enable
                                                      },
                                                      {.type = COMMAND_TYPE_WRITE_ONLY_UINT32,
                                                       .uuid = 0xFFE8,
@@ -2620,11 +2690,11 @@ static const struct ble_gatt_svc_def g_ble_spider_launcher_svcs[] = {
                 .flags = g_command_data_list[COMMAND_RESET_TO_DEFAULTS].flags
             },
             {
-                // "Emergency stop" characteristic
-                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_EMERGENCY_STOP].uuid),
-                .access_cb = g_command_data_list[COMMAND_EMERGENCY_STOP].characteristic_cb,
+                // "Emergency stop enable" characteristic
+                .uuid = BLE_UUID16_DECLARE(g_command_data_list[COMMAND_EMERGENCY_STOP_ENABLE].uuid),
+                .access_cb = g_command_data_list[COMMAND_EMERGENCY_STOP_ENABLE].characteristic_cb,
                 .arg = &g_context,
-                .flags = g_command_data_list[COMMAND_EMERGENCY_STOP].flags
+                .flags = g_command_data_list[COMMAND_EMERGENCY_STOP_ENABLE].flags
             },
             {
                 // "Play track" characteristic
@@ -2803,8 +2873,7 @@ static void motor_callback(void *motor, void *param)
 
     (void) motor;
 
-    retained_ram_t retained_ram = {.step_current = 0,
-                                   .step_ground_level = STEP_UNKNOWN};
+    retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
     FGR_RRAM_GET(retained_ram);
 
     if (retained_ram.step_current == STEP_UNKNOWN) {
@@ -2844,7 +2913,7 @@ static int32_t init(context_t *context)
 
         CONTEXT_LOCK(context->lock, "init");
 
-        retained_ram_t retained_ram;
+        retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
         if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
             if ((retained_ram.step_current != STEP_UNKNOWN) &&
                 (retained_ram.step_ground_level != STEP_UNKNOWN)) {
@@ -2852,14 +2921,17 @@ static int32_t init(context_t *context)
                 // were running, so set the initial
                 // state to resetting
                 int32_t height_steps = retained_ram.step_current - retained_ram.step_ground_level;
-                ESP_LOGI(TAG, "warm start (current height is %d mm (%d step(s))).",
-                        height_steps * QRD1114_STEP_LENGTH_MM, height_steps);
+                ESP_LOGI(TAG, "warm start (current height is %d mm (%d step(s)), %s).",
+                        height_steps * QRD1114_STEP_LENGTH_MM, height_steps,
+                        retained_ram.emergency_stopped ? "EMERGENCY STOPPED" : "not emergency stopped");
                 launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
             }
         } else {
-            // Set ground level to definitively unknown
+            // Set ground level to definitively unknown and make the
+            // current 0 and not emergency_stopped
             retained_ram.step_current = 0;
             retained_ram.step_ground_level = STEP_UNKNOWN;
+            retained_ram.emergency_stopped = false;
             FGR_RRAM_SET(retained_ram);
         }
 
