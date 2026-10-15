@@ -17,7 +17,7 @@
 /* This written by Google Gemini from my prompts. */
 
 // ######################################################################
-// This Android application works with ESP32 app BLE_INTERFACE_VERSION 0,
+// This Android application works with ESP32 app BLE_INTERFACE_VERSION 1,
 // see the ESP-IDF application in file spider_launcher.c for details.
 // ######################################################################
 
@@ -67,6 +67,7 @@ class MainActivity : ComponentActivity() {
 
     // Config values (Null until read from connected device)
     var autoEnable = mutableStateOf<Boolean?>(null)
+    var emergencyStop = mutableStateOf<Boolean?>(null)
     var autoPeriodSec = mutableStateOf<String?>(null)
     var heightMaxMm = mutableStateOf<String?>(null)
     var speedMmSec = mutableStateOf<String?>(null)
@@ -110,6 +111,7 @@ class MainActivity : ComponentActivity() {
 
     // Unified list controlling the exact order characteristics are read/updated
     private val ALL_CHARACTERISTIC_KEYS = listOf(
+        "EMERGENCY_STOP",
         "STATE",
         "HEIGHT_CURRENT_MM",
         "AUTO",
@@ -151,6 +153,7 @@ class MainActivity : ComponentActivity() {
                         connectionStatus = connectionStatus.value,
                         deviceState = deviceStateName.value,
                         currentHeight = currentHeightMm.value,
+                        emergencyStop = emergencyStop.value,
                         autoEnable = autoEnable.value,
                         autoPeriodSec = autoPeriodSec.value,
                         heightMaxMm = heightMaxMm.value,
@@ -286,6 +289,7 @@ class MainActivity : ComponentActivity() {
                 val uuid = characteristic.uuid
 
                 when (uuid) {
+                    CHAR_UUIDS["EMERGENCY_STOP"] -> emergencyStop.value = intVal != 0
                     CHAR_UUIDS["STATE"] -> {
                         if (intVal in launcherStates.indices) {
                             deviceStateName.value = launcherStates[intVal]
@@ -457,32 +461,32 @@ fun HoldingActionButton(
     val coroutineScope = rememberCoroutineScope()
     var job by remember { mutableStateOf<Job?>(null) }
 
+    // Use primary with standard 12% alpha when disabled to match standard Material Buttons
+    val backgroundColor = if (isConnected) containerColor else containerColor.copy(alpha = 0.12f)
+    val textColor = if (isConnected) contentColor else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+
     Box(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .height(40.dp)
             .background(
-                color = if (isConnected) containerColor else containerColor.copy(alpha = 0.38f),
+                color = backgroundColor,
                 shape = MaterialTheme.shapes.extraLarge
             )
             .pointerInput(isConnected) {
                 if (!isConnected) return@pointerInput
                 detectTapGestures(
                     onPress = {
-                        // Finger down: Fire immediately and start repeating loop
                         onActionStart()
                         job = coroutineScope.launch {
                             while (isActive) {
-                                delay(150) // Repeat interval for rapid fire
+                                delay(150)
                                 onActionStart()
                             }
                         }
-
-                        // Wait until finger is lifted
                         try {
                             awaitRelease()
                         } finally {
-                            // Finger up: Cancel loop
                             job?.cancel()
                             job = null
                             onActionStop()
@@ -495,7 +499,7 @@ fun HoldingActionButton(
         Text(
             text = text,
             style = MaterialTheme.typography.labelLarge,
-            color = if (isConnected) contentColor else contentColor.copy(alpha = 0.38f)
+            color = textColor
         )
     }
 }
@@ -642,6 +646,7 @@ fun MainScreen(
     connectionStatus: String,
     deviceState: String,
     currentHeight: String?,
+    emergencyStop: Boolean?,
     autoEnable: Boolean?,
     autoPeriodSec: String?,
     heightMaxMm: String?,
@@ -658,6 +663,8 @@ fun MainScreen(
     val scrollState = rememberScrollState()
     val focusManager = LocalFocusManager.current
     val isConnected = (connectionStatus == "Connected")
+    val isEStopActive = emergencyStop == true
+    val areMotorsEnabled = isConnected && !isEStopActive
     var showDialog by remember { mutableStateOf(false) }
     var dialogTitle by remember { mutableStateOf("") }
     var dialogMessage by remember { mutableStateOf("") }
@@ -699,12 +706,11 @@ fun MainScreen(
                     focusManager.clearFocus() // Clears focus when tapping anywhere on the background
                 })
             }
-            .padding(16.dp)
+            .padding(8.dp)
             .statusBarsPadding()
             .verticalScroll(scrollState),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // ... rest of your layout ...
         Text("Spider Launcher Control", style = MaterialTheme.typography.headlineMedium)
         Spacer(modifier = Modifier.height(8.dp))
 
@@ -717,17 +723,24 @@ fun MainScreen(
                 Text("Connection: $connectionStatus", style = MaterialTheme.typography.bodyLarge)
                 Text("Device State: $deviceState", style = MaterialTheme.typography.titleMedium, color = Color.Red)
                 Text("Current Height: ${currentHeight ?: "--"}", style = MaterialTheme.typography.bodyMedium)
+                if (isEStopActive) {
+                    Text("EMERGENCY STOP ENGAGED", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.error)
+                }
             }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
+
+        // Launch and E-Stop Row
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             Button(
                 onClick = { onSendCommand("LAUNCH_NOW") },
-                enabled = isConnected,
+                enabled = areMotorsEnabled,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                    disabledContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                    disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                 ),
                 elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp),
                 modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
@@ -735,29 +748,52 @@ fun MainScreen(
                 Text("Launch")
             }
 
+            // Emergency Stop Button: Uses primary color when disengaged so it matches Launch/Steps, turns bright red only when active
+            val eStopContainerColor = if (isEStopActive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+            val eStopContentColor = if (isEStopActive) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary
+
             Button(
-                onClick = { onSendCommand("EMERGENCY_STOP") },
-                enabled = isConnected,
+                onClick = {
+                    if (isEStopActive) {
+                        confirmAndExecute(
+                            "Clear E-Stop",
+                            "Are you sure you want to clear the Emergency Stop?"
+                        ) {
+                            onSendValueCommand("EMERGENCY_STOP", 0)
+                        }
+                    } else {
+                        onSendValueCommand("EMERGENCY_STOP", 1)
+                    }
+                },
+                enabled = isConnected, // Only disabled if disconnected entirely, stays active even if e-stop is on so you can clear it
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error,
-                    contentColor = MaterialTheme.colorScheme.onError
+                    containerColor = eStopContainerColor,
+                    contentColor = eStopContentColor,
+                    disabledContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                    disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                 ),
-                elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp),
+                elevation = ButtonDefaults.buttonElevation(defaultElevation = if (isEStopActive) 8.dp else 4.dp),
                 modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
             ) {
-                Text("E-Stop", style = MaterialTheme.typography.labelLarge.copy(color = MaterialTheme.colorScheme.onError))
+                Text(if (isEStopActive) "E-STOP ACTIVE" else "EMERGENCY STOP", style = MaterialTheme.typography.labelLarge)
             }
         }
+
+        // Step up / Step down row
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             HoldingActionButton(
                 text = "Step up",
-                isConnected = isConnected,
+                isConnected = areMotorsEnabled,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
                 modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
                 onActionStart = { onSendCommand("UP") }
             )
             HoldingActionButton(
                 text = "Step down",
-                isConnected = isConnected,
+                isConnected = areMotorsEnabled,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
                 modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
                 onActionStart = { onSendCommand("DOWN") }
             )
