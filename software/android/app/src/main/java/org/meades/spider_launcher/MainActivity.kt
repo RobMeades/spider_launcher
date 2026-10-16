@@ -277,8 +277,27 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Callback for Android 13+ (API 33+)
         override fun onCharacteristicRead(
             gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            handleCharacteristicRead(characteristic, value, status)
+        }
+
+        // Callback for Android 12 and below (API < 33, e.g., Android 9 / API 28)
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            handleCharacteristicRead(characteristic, characteristic.value ?: byteArrayOf(), status)
+        }
+
+        private fun handleCharacteristicRead(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
             status: Int
