@@ -133,7 +133,7 @@ int32_t fgr_nvs_set(const char *name, uint32_t value)
     nvs_handle_t nvs_handle;
 
     if (name) {
-        esp_err_t err = nvs_open(FGR_NVS_STORAGE_AREA, NVS_READWRITE, &nvs_handle);
+        err = nvs_open(FGR_NVS_STORAGE_AREA, NVS_READWRITE, &nvs_handle);
         if (err == ESP_OK) {
             err = nvs_set_u32(nvs_handle, name, value);
             if (err == ESP_OK) {
