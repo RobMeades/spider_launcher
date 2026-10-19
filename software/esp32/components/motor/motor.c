@@ -15,7 +15,7 @@
  */
 
 /** @file
- * @brief Task A brushless motor driver.
+ * @brief A motor driver.
  */
 
 // Ensure we are compiling with maximum debug, can then be trimmed
@@ -33,14 +33,14 @@
 
 #include "fgr_util.h"
 
-#include "motor_brushless.h"
+#include "motor.h"
 
 /* ----------------------------------------------------------------
  * COMPILE-TIME MACROS
  * -------------------------------------------------------------- */
 
 // Logging prefix
-#define TAG "brushless_motor"
+#define TAG "motor"
 
 // Set the timer resolution for PWM: with a value of 10000000 we
 // get 10 MHz, 1 tick = 0.1us
@@ -65,24 +65,24 @@
 
 // Structure to keep track of all the elements of an MCPWM motor
 // driver, designed to be used as part of a linked list.
-typedef struct motor_t {
+struct motor {
     int32_t pwm_pin;
     int32_t dir_pin;
     int32_t sensor_pin;
-    brushless_motor_cb_t cb;
+    motor_cb_t cb;
     void *cb_param;
     mcpwm_timer_handle_t timer;
     mcpwm_oper_handle_t operator;
     mcpwm_cmpr_handle_t comparator;
     mcpwm_gen_handle_t generator;
-    int32_t sensor_confidence;
-    bool sensor_state;
+    volatile int32_t sensor_confidence;
+    volatile bool sensor_is_triggered;
     esp_timer_handle_t sensor_timer;
-    SLIST_ENTRY(motor_t) next;
-} motor_t;
+    SLIST_ENTRY(motor) next;
+};
 
 // Motor list head.
-SLIST_HEAD(motor_list_t, motor_t);
+SLIST_HEAD(motor_list_t, motor);
 
 // Context.
 typedef struct {
@@ -101,10 +101,44 @@ static context_t g_context = {0};
  * STATIC FUNCTIONS
  * -------------------------------------------------------------- */
 
+// Set the motor speed.
+// IMPORTANT: the context must be locked before this is called.
+static esp_err_t set_speed(motor_t *motor, int32_t pwm_rate_percent)
+{
+    esp_err_t err;
+
+    if (pwm_rate_percent > 100) {
+        pwm_rate_percent = 100;
+    }
+    if (pwm_rate_percent < -100) {
+        pwm_rate_percent = -100;
+    }
+    if (pwm_rate_percent == 0) {
+        // Timer off
+        err = mcpwm_comparator_set_compare_value(((motor_t *) motor)->comparator, 0);
+    } else {
+        // Set direction
+        gpio_set_level(((motor_t *) motor)->dir_pin, (pwm_rate_percent < 0) ? 1 : 0);
+
+        // Set duty
+        int32_t abs_pwm_rate_percent = pwm_rate_percent;
+        if (abs_pwm_rate_percent < 0) {
+            abs_pwm_rate_percent = -abs_pwm_rate_percent;
+        }
+        uint32_t duty_ticks = (abs_pwm_rate_percent * TIMER_PERIOD_TICKS) / 100;
+        err = mcpwm_comparator_set_compare_value(((motor_t *) motor)->comparator, duty_ticks);
+    }
+
+    return err;
+}
+
 // Sample the sensor
 static void sensor_sample(void *arg)
 {
     motor_t *motor = (motor_t *) arg;
+
+    CONTEXT_LOCK(g_context.lock, "sensor_sample()");
+
     bool raw = (gpio_get_level(motor->sensor_pin) == 0);
 
     if (raw) {
@@ -118,14 +152,17 @@ static void sensor_sample(void *arg)
     }
 
     // Hysteresis on the confidence value
-    if (!motor->sensor_state && (motor->sensor_confidence >= SENSOR_THRESHOLD)) {
-        motor->sensor_state = true;
+    if (!motor->sensor_is_triggered && (motor->sensor_confidence >= SENSOR_THRESHOLD)) {
+        motor->sensor_is_triggered = true;
+        ESP_LOGD(TAG, "sensor %s", motor->sensor_is_triggered ? "TRIGGERED" : "not triggered");
         if (motor->cb) {
             motor->cb(motor, motor->cb_param);
         }
-    } else if (motor->sensor_state && (motor->sensor_confidence == 0)) {
-        motor->sensor_state = false;
+    } else if (motor->sensor_is_triggered && (motor->sensor_confidence == 0)) {
+        motor->sensor_is_triggered = false;
     }
+
+    CONTEXT_UNLOCK(g_context.lock, "sensor_sample()");
 }
 
 // Clean up a motor.
@@ -185,7 +222,7 @@ static void clean_up(motor_t *motor)
  * -------------------------------------------------------------- */
 
 // Initialise the brushless motor module.
-int32_t motor_brushless_init()
+int32_t motor_init()
 {
     int32_t err = ESP_OK;
 
@@ -203,29 +240,29 @@ int32_t motor_brushless_init()
 }
 
 // Deinitialise the brushless motor module.
-void motor_brushless_deinit()
+void motor_deinit()
 {
-    CONTEXT_LOCK(g_context.lock, "motor_brushless_deinit()");
+    CONTEXT_LOCK(g_context.lock, "motor_deinit()");
 
     while (!SLIST_EMPTY(&g_context.motor_list)) {
         motor_t *p = SLIST_FIRST(&g_context.motor_list);
         clean_up(p);
     }
 
-    CONTEXT_UNLOCK(g_context.lock, "motor_brushless_deinit()");
+    CONTEXT_UNLOCK(g_context.lock, "motor_deinit()");
     // The semaphore will be re-used
 }
 
 // Create a brushless motor.
-void *motor_brushless_create(int32_t pwm_pin, int32_t dir_pin,
-                             int32_t sensor_pin,
-                             brushless_motor_cb_t cb, void *cb_param)
+motor_t *motor_create(int32_t pwm_pin, int32_t dir_pin,
+                      int32_t sensor_pin,
+                      motor_cb_t cb, void *cb_param)
 {
     motor_t *motor = malloc(sizeof(*motor));
 
     if (motor) {
 
-        CONTEXT_LOCK(g_context.lock, "motor_brushless_create()");
+        CONTEXT_LOCK(g_context.lock, "motor_create()");
 
         memset(motor, 0, sizeof(*motor));
 
@@ -336,52 +373,54 @@ void *motor_brushless_create(int32_t pwm_pin, int32_t dir_pin,
             motor = NULL;
         }
 
-        CONTEXT_UNLOCK(g_context.lock, "motor_brushless_create()");
+        CONTEXT_UNLOCK(g_context.lock, "motor_create()");
     }
 
     return motor;
 }
 
-// Free a brushless motor.
-void motor_brushless_destroy(void *motor)
+// Free a motor.
+void motor_destroy(motor_t *motor)
 {
-    CONTEXT_LOCK(g_context.lock, "motor_brushless_destroy()");
+    CONTEXT_LOCK(g_context.lock, "motor_destroy()");
     clean_up(motor);
-    CONTEXT_UNLOCK(g_context.lock, "motor_brushless_destroy()");
+    CONTEXT_UNLOCK(g_context.lock, "motor_destroy()");
 }
 
-// Set the speed and direction of motor rotation.
-int32_t motor_brushless_set_speed(void *motor, int32_t pwm_rate_percent)
+int32_t motor_speed_set(motor_t *motor, int32_t pwm_rate_percent)
 {
-    int32_t err = ESP_ERR_INVALID_ARG;
+    esp_err_t err = ESP_ERR_INVALID_ARG;
 
     if (motor) {
-        err = ESP_OK;
         if (pwm_rate_percent > 100) {
             pwm_rate_percent = 100;
         }
         if (pwm_rate_percent < -100) {
             pwm_rate_percent = -100;
         }
-        if (pwm_rate_percent == 0) {
-            // Timer off
-            err = mcpwm_comparator_set_compare_value(((motor_t *) motor)->comparator, 0);
-        } else {
-            // Set direction
-            gpio_set_level(((motor_t *) motor)->dir_pin, (pwm_rate_percent < 0) ? 1 : 0);
 
-            // Set duty
-            int32_t abs_pwm_rate_percent = pwm_rate_percent;
-            if (abs_pwm_rate_percent < 0) {
-                abs_pwm_rate_percent = -abs_pwm_rate_percent;
-            }
-            uint32_t duty_ticks = (abs_pwm_rate_percent * TIMER_PERIOD_TICKS) / 100;
-            err = mcpwm_comparator_set_compare_value(((motor_t *) motor)->comparator, duty_ticks);
-        }
+        CONTEXT_LOCK(g_context.lock, "motor_speed_set()");
+        err = set_speed(motor, pwm_rate_percent);
+        CONTEXT_UNLOCK(g_context.lock, "motor_speed_set()");
     }
 
-    // Return negative value from esp_err_t.
-    return -err;
+    return (int32_t) -err;
+}
+
+// Determine if the sensor associated is currently triggered.
+bool motor_sensor_is_triggered(motor_t *motor)
+{
+    bool is_triggered = false;
+
+    CONTEXT_LOCK(g_context.lock, "motor_sensor_is_triggered()");
+
+    if (motor) {
+        is_triggered = motor->sensor_is_triggered;
+    }
+
+    CONTEXT_UNLOCK(g_context.lock, "motor_sensor_is_triggered()");
+
+    return is_triggered;
 }
 
 // End of file
