@@ -17,7 +17,7 @@
 /* This written by Google Gemini from my prompts. */
 
 // ######################################################################
-// This Android application works with ESP32 app BLE_INTERFACE_VERSION 1,
+// This Android application works with ESP32 app BLE_INTERFACE_VERSION 2,
 // see the ESP-IDF application in file spider_launcher.c for details.
 // ######################################################################
 
@@ -127,9 +127,9 @@ class MainActivity : ComponentActivity() {
     )
 
     private val launcherStates = listOf(
-        "NULL", "HEIGHT_UNKNOWN", "READY", "STEP_UP", "STEP_DOWN",
-        "RUN", "RUNNING_SKITTERING", "RUNNING_JUMPING", "RUNNING_DANGLING",
-        "RUNNING_RESETTING", "HALT"
+        "NULL", "HEIGHT_UNKNOWN", "READY", "MOVE_UP", "MOVE_DOWN",
+        "RUN", "RUNNING_SKITTERING", "RUNNING_WAKING", "RUNNING_JUMPING",
+        "RUNNING_DANGLING", "RUNNING_RESETTING", "HALT"
     )
 
     // Queue for sequential GATT reads
@@ -272,7 +272,7 @@ class MainActivity : ComponentActivity() {
                 }
                 processNextRead()
 
-                // Start periodic polling loop for STATE and conditional height updates
+                // Start periodic polling loop for STATE and HEIGHT_CURRENT_MM updates
                 startPeriodicPolling()
             }
         }
@@ -337,13 +337,9 @@ class MainActivity : ComponentActivity() {
         pollingJob?.cancel()
         pollingJob = scope.launch {
             while (isActive && bluetoothGatt != null) {
-                // Re-read current state every 3 seconds
+                // Re-read current state and current height every 3 seconds
                 queueRead(CHAR_UUIDS["STATE"])
-
-                // Re-read current height every 3 seconds if state is RUNNING_*
-                if (deviceStateName.value.startsWith("RUNNING_")) {
-                    queueRead(CHAR_UUIDS["HEIGHT_CURRENT_MM"])
-                }
+                queueRead(CHAR_UUIDS["HEIGHT_CURRENT_MM"])
 
                 delay(3000)
             }
@@ -430,9 +426,14 @@ class MainActivity : ComponentActivity() {
         gatt.writeCharacteristic(characteristic)
 
         // Post-command trigger actions
-        if (charKey == "UP" || charKey == "DOWN" || charKey == "THIS_IS_GROUND_LEVEL") {
+        if (charKey == "THIS_IS_GROUND_LEVEL") {
             android.os.Handler(mainLooper).postDelayed({
                 queueRead(CHAR_UUIDS["HEIGHT_CURRENT_MM"])
+            }, 500)
+        } else if (charKey == "THIS_IS_HEIGHT_MAX") {
+            // Re-read max height after recording the new limit
+            android.os.Handler(mainLooper).postDelayed({
+                queueRead(CHAR_UUIDS["HEIGHT_MAX_MM"])
             }, 500)
         } else if (charKey == "RESET_TO_DEFAULTS") {
             android.os.Handler(mainLooper).postDelayed({
@@ -468,19 +469,19 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun HoldingActionButton(
+fun MoveActionButton(
     text: String,
+    charKey: String,
+    targetStateName: String,
     isConnected: Boolean,
+    deviceState: String,
     containerColor: Color = MaterialTheme.colorScheme.primary,
     contentColor: Color = MaterialTheme.colorScheme.onPrimary,
     modifier: Modifier = Modifier,
-    onActionStart: () -> Unit,
-    onActionStop: () -> Unit = {}
+    onWriteValue: (String, Int) -> Unit
 ) {
     val coroutineScope = rememberCoroutineScope()
-    var job by remember { mutableStateOf<Job?>(null) }
 
-    // Use primary with standard 12% alpha when disabled to match standard Material Buttons
     val backgroundColor = if (isConnected) containerColor else containerColor.copy(alpha = 0.12f)
     val textColor = if (isConnected) contentColor else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
 
@@ -496,19 +497,35 @@ fun HoldingActionButton(
                 if (!isConnected) return@pointerInput
                 detectTapGestures(
                     onPress = {
-                        onActionStart()
-                        job = coroutineScope.launch {
+                        // Send true immediately on press
+                        onWriteValue(charKey, 1)
+
+                        // Repeat sending true every 250ms while pressed
+                        val pressJob = coroutineScope.launch {
                             while (isActive) {
-                                delay(150)
-                                onActionStart()
+                                delay(250)
+                                onWriteValue(charKey, 1)
                             }
                         }
+
                         try {
                             awaitRelease()
                         } finally {
-                            job?.cancel()
-                            job = null
-                            onActionStop()
+                            // Cancel the press loop on release
+                            pressJob.cancel()
+
+                            // Send false continuously every 250ms until device state changes or 5s expires
+                            coroutineScope.launch {
+                                val startTime = System.currentTimeMillis()
+                                while (isActive) {
+                                    onWriteValue(charKey, 0)
+
+                                    if (deviceState != targetStateName || (System.currentTimeMillis() - startTime) > 5000) {
+                                        break
+                                    }
+                                    delay(250)
+                                }
+                            }
                         }
                     }
                 )
@@ -537,7 +554,7 @@ fun SectionDivider(title: String) {
             color = MaterialTheme.colorScheme.outlineVariant
         )
         Surface(
-            color = MaterialTheme.colorScheme.background, // Matches screen background to mask the line behind the text
+            color = MaterialTheme.colorScheme.background,
             modifier = Modifier.padding(horizontal = 8.dp)
         ) {
             Text(
@@ -635,7 +652,6 @@ fun CompactParamRow(
                 .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.small)
                 .padding(horizontal = 8.dp, vertical = 6.dp)
                 .onFocusChanged { focusState ->
-                    // Revert to original value if focus is lost and changes weren't saved
                     if (!focusState.isFocused) {
                         textValue = value ?: ""
                     }
@@ -722,7 +738,7 @@ fun MainScreen(
             .fillMaxSize()
             .pointerInput(Unit) {
                 detectTapGestures(onTap = {
-                    focusManager.clearFocus() // Clears focus when tapping anywhere on the background
+                    focusManager.clearFocus()
                 })
             }
             .padding(8.dp)
@@ -767,7 +783,6 @@ fun MainScreen(
                 Text("Launch")
             }
 
-            // Emergency Stop Button: Uses primary color when disengaged so it matches Launch/Steps, turns bright red only when active
             val eStopContainerColor = if (isEStopActive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
             val eStopContentColor = if (isEStopActive) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary
 
@@ -784,7 +799,7 @@ fun MainScreen(
                         onSendValueCommand("EMERGENCY_STOP", 1)
                     }
                 },
-                enabled = isConnected, // Only disabled if disconnected entirely, stays active even if e-stop is on so you can clear it
+                enabled = isConnected,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = eStopContainerColor,
                     contentColor = eStopContentColor,
@@ -798,23 +813,29 @@ fun MainScreen(
             }
         }
 
-        // Step up / Step down row
+        // Move up / Move down row
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            HoldingActionButton(
-                text = "Step up",
+            MoveActionButton(
+                text = "Move up",
+                charKey = "UP",
+                targetStateName = "MOVE_UP",
                 isConnected = areMotorsEnabled,
+                deviceState = deviceState,
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
                 modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                onActionStart = { onSendCommand("UP") }
+                onWriteValue = { name, value -> onSendValueCommand(name, value) }
             )
-            HoldingActionButton(
-                text = "Step down",
+            MoveActionButton(
+                text = "Move down",
+                charKey = "DOWN",
+                targetStateName = "MOVE_DOWN",
                 isConnected = areMotorsEnabled,
+                deviceState = deviceState,
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
                 modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                onActionStart = { onSendCommand("DOWN") }
+                onWriteValue = { name, value -> onSendValueCommand(name, value) }
             )
         }
 
