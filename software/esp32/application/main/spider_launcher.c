@@ -180,7 +180,7 @@
 #define SPEED_MIN_MM_PER_SECOND 2500
 
 // The speed value to hold the winch in position.
-#define SPEED_HOLD_MM_PER_SECOND 2000
+#define SPEED_HOLD_MM_PER_SECOND 1000
 
 // The PWM hold percentage.
 #define PWM_HOLD_PERCENT (100 * (SPEED_HOLD_MM_PER_SECOND) / (SPEED_MAX_MM_PER_SECOND))
@@ -202,7 +202,7 @@
 #define RESETTING_SPEED_MODIFIER_PERCENT 50
 
 // Percentage speed reduction when just moving up or down.
-#define MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT 75
+#define MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT 100
 
 // The maximum duration for a move up or down in milliseconds
 #define MOVE_UP_DOWN_DURATION_MAX_MS 500
