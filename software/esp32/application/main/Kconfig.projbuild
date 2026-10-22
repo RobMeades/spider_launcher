@@ -6,27 +6,34 @@ menu "Application Configuration"
         help
             The pin where a debug LED is connected
 
+    config SPIDER_LAUNCHER_USE_STEPPER
+        bool
+        default y
+
     config SPIDER_LAUNCHER_MOTOR_DIRECTION_PIN
         int "Motor direction pin"
         default 8
+        depends on !SPIDER_LAUNCHER_USE_STEPPER
         help
             Pin wired to the DIR1 pin of the MDD10A motor driver board
 
     config SPIDER_LAUNCHER_MOTOR_PWM_PIN
         int "Motor PWM pin"
         default 7
+        depends on !SPIDER_LAUNCHER_USE_STEPPER
         help
             Pin wired to the PWM1 pin of the MDD10A motor driver board
 
     config SPIDER_LAUNCHER_QRD1114_PIN
         int "QRD1114 pin"
         default 6
+        depends on !SPIDER_LAUNCHER_USE_STEPPER
         help
             Pin wired to the output of the QRD1114 sensor
 
     config SPIDER_LAUNCHER_AUDIO_USE_GPIO
         bool
-        default y if SPIDER_LAUNCHER_UART_NUM < 0
+        default y if SPIDER_LAUNCHER_AUDIO_UART_NUM < 0
         default n
 
     config SPIDER_LAUNCHER_AUDIO_PIN_0
@@ -77,7 +84,7 @@ menu "Application Configuration"
             UART RX pin wired to the UART Tx pin of the DY-HV8F audio board,
             ignored if SPIDER_LAUNCHER_UART_NUM is -1.
 
-    config SPIDER_LAUNCHER_UART_NUM
+    config SPIDER_LAUNCHER_AUDIO_UART_NUM
         int "Audio UART number"
         default -1
         help
@@ -85,8 +92,8 @@ menu "Application Configuration"
             if -1 then the SPIDER_LAUNCHER_AUDIO_PIN_x will be used to
             address the audio board with individual IOs instead.
 
-    config SPIDER_LAUNCHER_UART_BAUD_RATE
-        int "UART baud rate"
+    config SPIDER_LAUNCHER_AUDIO_UART_BAUD_RATE
+        int "UART baud rate for audio"
         default 9600
         depends on !SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help

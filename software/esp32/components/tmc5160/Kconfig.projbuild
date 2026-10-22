@@ -1,0 +1,45 @@
+menu "TMC5160 Configuration"
+
+    config TMC5160_SPI_NUM
+        int "The SPI port to use to talk to a TMC5160 stepper motor controller"
+        default 1
+        range -1 2
+        help
+            DO NOT USE SPI 0 (which maps to SPI1) as it is hard-wired internally
+            to flash memory.  The default here of 1 maps to SPI2, leaving 2
+            (which maps to SPI3) for other uses.
+
+    config TMC5160_SPI_SCK_PIN
+        int "TMC5160 SPI clock GPIO"
+        default 7
+
+    config TMC5160_SPI_MOSI_PIN
+        int "TMC5160 SPI MOSI GPIO (SDI)"
+        default 6
+
+    config TMC5160_SPI_MISO_PIN
+        int "TMC5160 SPI MISO GPIO (SDO)"
+        default 8
+
+    config TMC5160_SPI_CS_PIN
+        int "TMC5160 SPI chip select GPIO (CSN)"
+        default 1
+
+    config TMC5160_SPI_CLOCK_HZ
+        int "TMC5160 SPI clock frequency (Hz)"
+        default 1000000
+        range 100000 4000000
+
+    config TMC5160_ENABLE_PIN
+        int "stepper enable pin"
+        default 3
+        help
+            Pin connected to the TMC5160 EN pin
+
+    config TMC5160_DIAG_PIN
+        int "DIAG pin for stepper motor control"
+        default 2
+        help
+            Pin connected to the TMC5160 DIAG pin, use -1 if there is none.
+
+endmenu

@@ -48,6 +48,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include "esp_err.h"
+#include "esp_log_level.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -63,6 +64,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "sdkconfig.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "host/ble_gap.h"
@@ -76,7 +78,8 @@
 #include "fgr_nvs.h"
 #include "fgr_task.h"
 #include "fgr_rram.h"
-#include "motor.h"
+
+#include "tmc5160.h"
 
 /* ----------------------------------------------------------------
  * COMPILE-TIME MACROS
@@ -91,6 +94,34 @@
 
 // UART buffer.
 #define UART_RX_BUFFFER_SIZE 256
+
+// TMC5160 stepper motor controller address.
+#define TMC5160_ADDRESS 0
+
+// The sense resisitor wired to the TMC5160, the BigTreeTech board
+// uses 0.022 Ohms.
+#define TMC5160_RSENSE_MOHM 22
+
+// TBL time for the stepper motor, see tmc5160_configure_chopper().
+#define TMC5160_TBL 1
+
+// TOFF time for the stepper motor, see tmc5160_configure_chopper().
+#define TMC5160_TOFF 3
+
+// HSTRT time for the stepper motor, see tmc5160_configure_chopper().
+#define TMC5160_HSTRT 4
+
+// HEND time for the stepper motor, see tmc5160_configure_chopper().
+#define TMC5160_HEND -2
+
+// The microstep resolution for the motor (1 to 256 in powers of two).
+#define TMC5160_MICROSTEP_RESOLUTION 256
+
+// How much current to feed to the stepper motor when running.
+#define TMC5160_RUN_CURRENT_MA 1200
+
+// The percentage to apply to the run current when holding.
+#define TMC5160_HOLD_CURRENT_PERCENT 50
 
 // An unused track number (if it gets played nothing will happen).
 #define TRACK_NUMBER_UNUSED 0
@@ -312,6 +343,11 @@ typedef struct {
 
 // Structure to hold motor data
 typedef struct {
+#if 1
+    stepper_t *handle;
+    TaskHandle_t task_stall;
+    QueueHandle_t queue_stall;
+#else
     motor_t *handle;
     int32_t pwm;
     volatile bool sensor_trigger_last_populated;
@@ -320,6 +356,7 @@ typedef struct {
     volatile size_t sensor_interval_buffer_index;
     volatile size_t sensor_interval_buffer_num_entries;
     volatile int64_t sensor_interval_buffer_total_us;
+#endif
 } launcher_motor_t;
 
 // The launcher context
@@ -809,7 +846,7 @@ static void nvs_populate(nvs_shadow_t *nvs_shadow)
  * STATIC FUNCTIONS: DY-HV8F AUDIO BOARD RELATED
  * -------------------------------------------------------------- */
 
-#if !defined(CONFIG_SPIDER_LAUNCHER_UART_NUM) || (CONFIG_SPIDER_LAUNCHER_UART_NUM < 0)
+#if !defined(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM) || (CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM < 0)
 static uint8_t audio_play_set_pin(uint32_t track_number, int32_t bit_mask, int32_t pin, bool highNotLow)
 {
     uint8_t resulting_bit_pattern = track_number & bit_mask;
@@ -827,7 +864,7 @@ static uint8_t audio_play_set_pin(uint32_t track_number, int32_t bit_mask, int32
 // Play the given audio track.
 static void audio_play_track(uint32_t track_number)
 {
-#if defined(CONFIG_SPIDER_LAUNCHER_UART_NUM) && (CONFIG_SPIDER_LAUNCHER_UART_NUM >= 0)
+#if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM) && (CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM >= 0)
     // Command format is:
     //
     // 0xAA 0x04 0x03 high_byte low_byte checksum
@@ -848,13 +885,13 @@ static void audio_play_track(uint32_t track_number)
     }
     buffer[FGR_UTIL_ARRAY_LENGTH(buffer) - 1] = checksum;
 
-    int32_t x = uart_write_bytes(CONFIG_SPIDER_LAUNCHER_UART_NUM, buffer, sizeof(buffer));
+    int32_t x = uart_write_bytes(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM, buffer, sizeof(buffer));
     ESP_LOGI("DEBUG", "to play audio track %d sent %d byte(s) {0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x} on UART %d, TXD on pin %d.",
-             track_number, x, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], CONFIG_SPIDER_LAUNCHER_UART_NUM,
+             track_number, x, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM,
              CONFIG_SPIDER_LAUNCHER_AUDIO_UART_TXD_PIN);
 
     // Wait for transmission to complete
-    uart_wait_tx_done(CONFIG_SPIDER_LAUNCHER_UART_NUM, pdMS_TO_TICKS(100));
+    uart_wait_tx_done(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM, pdMS_TO_TICKS(100));
 #else
     // In GPIO control mode: each GPIO line is one bit in an up-to-four-bit
     // binary word which is set low to indicate a 1, high to indicate a 0.
@@ -1115,6 +1152,37 @@ static void ble_task(void *param)
  * STATIC FUNCTIONS: MOTOR RELATED
  * -------------------------------------------------------------- */
 
+#if 1
+
+# if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
+// Stall interrupt handler,
+static void motor_stall_interrupt_handler(void *arg)
+{
+    launcher_motor_t *motor = (launcher_motor_t *) arg;
+    BaseType_t higherPriorityTaskWoken;
+
+    if (motor->task_stall && motor->queue_stall) {
+        uint8_t empty = 0;
+        xQueueSendFromISR(motor->queue_stall, &empty, &higherPriorityTaskWoken);
+        portYIELD_FROM_ISR(higherPriorityTaskWoken);
+    }
+}
+# endif
+
+// Callback to be run in task context to handle stall indications.
+static void motor_stall_task_cb(void *handle, void *arg)
+{
+    launcher_motor_t *motor = (launcher_motor_t *) arg;
+    uint8_t empty = 0;
+
+    (void) handle;
+
+    while (xQueueReceive(motor->queue_stall, &empty, 0) == pdTRUE) {
+        ESP_LOGI(TAG, "STALL");
+    }
+}
+
+#else
 // Reset the motor sensor interval averaging buffer; call this when changing speed.
 static void motor_reset_buffer(launcher_motor_t *motor)
 {
@@ -1154,12 +1222,19 @@ static int32_t motor_abs_speed_mm_per_second(launcher_motor_t *motor)
 
     return abs_speed_mm_per_second;
 }
+#endif
 
 // Start the motor speed in the given direction.
 static void motor_start(launcher_motor_t *motor, bool direction_up_not_down,
                         uint32_t abs_speed_mm_per_second,
                         uint32_t speed_modifier_percent)
 {
+#if 1
+    (void) motor;
+    (void) direction_up_not_down;
+    (void) abs_speed_mm_per_second;
+    (void) speed_modifier_percent;
+#else
     int32_t speed_mm_per_second = (int32_t) abs_speed_mm_per_second * speed_modifier_percent / 100;
 
     // Don't allow stupidly low speeds as we may think the motor
@@ -1185,11 +1260,16 @@ static void motor_start(launcher_motor_t *motor, bool direction_up_not_down,
         ESP_LOGE(TAG, "unable to set speed to %d mm/s (pwm %d%%) (%s).",
                  speed_mm_per_second, pwm, esp_err_to_name(-err));
     }
+#endif
 }
 
 // Stop the motor.
 static void motor_stop(launcher_motor_t *motor, bool and_hold)
 {
+#if 1
+    (void) motor;
+    (void) and_hold;
+#else
     int32_t pwm = 0;
     if (and_hold) {
         pwm = PWM_HOLD_PERCENT;
@@ -1222,8 +1302,11 @@ static void motor_stop(launcher_motor_t *motor, bool and_hold)
     } else {
         ESP_LOGE(TAG, "unable to stop motor (%s).", esp_err_to_name(-err));
     }
+#endif
 }
 
+#if 1
+#else
 // Callback called each time the QRD1114 sensor on the motor is triggered.
 static void motor_cb(motor_t *unused, void *param)
 {
@@ -1278,6 +1361,7 @@ static void motor_cb(motor_t *unused, void *param)
              retained_ram.step_current, sensor_interval_time_us);
 
 }
+#endif
 
 /* ----------------------------------------------------------------
  * STATIC FUNCTIONS: LAUNCHER (ACTUALLY DOING STUFF)
@@ -3157,6 +3241,103 @@ static int32_t init(context_t *context)
             FGR_RRAM_SET(retained_ram);
         }
 
+        // Initialise tasking, FGR style
+        if (err == ESP_OK) {
+            err = fgr_task_init();
+        }
+
+#if 1
+        // Initialise the TMC5160 stepper motor controller
+        if (err == ESP_OK) {
+            launcher_motor_t *motor = &launcher->motor;
+            err = tmc5160_init(CONFIG_TMC5160_SPI_NUM, CONFIG_TMC5160_SPI_SCK_PIN,
+                               CONFIG_TMC5160_SPI_MOSI_PIN, CONFIG_TMC5160_SPI_MISO_PIN,
+                               CONFIG_TMC5160_SPI_CS_PIN, CONFIG_TMC5160_SPI_CLOCK_HZ);
+            if (err == ESP_OK) {
+                err = -ESP_ERR_NO_MEM;
+                motor->handle = tmc5160_create(TMC5160_ADDRESS,
+                                               CONFIG_TMC5160_ENABLE_PIN);
+                if (motor->handle) {
+                    // Set the chopper configuration
+                    err = tmc5160_configure_chopper(motor->handle,
+                                                    TMC5160_TBL,
+                                                    TMC5160_TOFF,
+                                                    TMC5160_HSTRT,
+                                                    TMC5160_HEND);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "unable to configure chopper (%s)!", esp_err_to_name(-err));
+                    }
+                    if (err == ESP_OK) {
+                        // Set the microstep resolution
+                        err = tmc5160_set_microstep_resolution(motor->handle, TMC5160_MICROSTEP_RESOLUTION);
+                        if (err >= 0) {
+                            ESP_LOGI(TAG, "microstep resolution set to %d.", TMC5160_MICROSTEP_RESOLUTION);
+                            err = ESP_OK;
+                        } else {
+                            ESP_LOGE(TAG, "unable to set microstep resolution to %d!", TMC5160_MICROSTEP_RESOLUTION);
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "unable to configure chopper (%s)!", esp_err_to_name(-err));
+                    }
+                    if (err == ESP_OK) {
+                        err = tmc5160_set_chopper_mode(motor->handle, TMC5160_CHOPPER_STEALTH_CHOP);
+                        if (err == ESP_OK) {
+                            ESP_LOGI(TAG, "chopper mode set to TMC5160_CHOPPER_STEALTH_CHOP.");
+                            err = ESP_OK;
+                        } else {
+                            ESP_LOGE(TAG, "unable to set chopper mode to TMC5160_CHOPPER_STEALTH_CHOP!",
+                                     esp_err_to_name(-err));
+                        }
+                    }
+                    if (err == ESP_OK) {
+                        // Set the motor current
+                        err = tmc5160_set_current(motor->handle, TMC5160_RSENSE_MOHM,
+                                                  TMC5160_RUN_CURRENT_MA,
+                                                  TMC5160_HOLD_CURRENT_PERCENT);
+                        if (err >= 0) {
+                            ESP_LOGI(TAG, "motor current set to %d mA.", err);
+                            err = ESP_OK;
+                        } else {
+                            ESP_LOGE(TAG, "unable to set motor current to %d mA (%s)!",
+                                     TMC5160_RUN_CURRENT_MA, esp_err_to_name(-err));
+                        }
+                    }
+                    if (err == ESP_OK) {
+                        err = tmc5160_motor_enable(motor->handle);
+                        if (err == ESP_OK) {
+                            ESP_LOGI(TAG, "motor is enabled.");
+                            err = ESP_OK;
+                        } else {
+                            ESP_LOGE(TAG, "unable to enable the motor (%s)!", esp_err_to_name(-err));
+                        }
+                    }
+                }
+            }
+            // Create the RTOS stuff needed for stall handling
+            if (err == ESP_OK) {
+                err = -ESP_ERR_NO_MEM;
+                motor->queue_stall = xQueueCreate(10, sizeof(uint8_t));
+                if (motor->queue_stall) {
+                    err = fgr_task_create(&motor_stall_task_cb, motor, "stall_task", 4096, 3, &motor->task_stall);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "unable to create motor stall task (%s)!", esp_err_to_name(-err));
+                    }
+                } else {
+                    ESP_LOGE(TAG, "unable to create motor stall queue!");
+                }
+
+#if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
+                // Initial setup of stall detection with threshold value that means
+                // a stall should never be detected
+                if (err == ESP_OK) {
+                    //tmc5160_init_stallguard(motor->handle, -1, 63, CONFIG_TMC5160_DIAG_PIN,
+                    //                        motor_stall_interrupt_handler, motor);
+                }
+#endif
+
+            }
+        }
+#else
         // Initialise a brushless motor
         if (err == ESP_OK) {
             err = motor_init();
@@ -3172,12 +3353,12 @@ static int32_t init(context_t *context)
                 }
             }
         }
-
-#if defined(CONFIG_SPIDER_LAUNCHER_UART_NUM) && (CONFIG_SPIDER_LAUNCHER_UART_NUM >= 0)
+#endif
+#if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM) && (CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM >= 0)
         // Initialise a UART to control the DY HV8F audio board
         if (err == ESP_OK) {
             const uart_config_t cfg = {
-                .baud_rate = 9600,
+                .baud_rate = SPIDER_LAUNCHER_AUDIO_UART_BAUD_RATE,
                 .data_bits = UART_DATA_8_BITS,
                 .parity = UART_PARITY_DISABLE,
                 .stop_bits = UART_STOP_BITS_1,
@@ -3185,12 +3366,12 @@ static int32_t init(context_t *context)
                 .source_clk = UART_SCLK_DEFAULT,
             };
 
-            err = -uart_driver_install(CONFIG_SPIDER_LAUNCHER_UART_NUM, UART_RX_BUFFFER_SIZE, 0, 0, NULL, 0);
+            err = -uart_driver_install(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM, UART_RX_BUFFFER_SIZE, 0, 0, NULL, 0);
             if (err == ESP_OK) {
-                err = -uart_param_config(CONFIG_SPIDER_LAUNCHER_UART_NUM, &cfg);
+                err = -uart_param_config(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM, &cfg);
             }
             if (err == ESP_OK) {
-                err = -uart_set_pin(CONFIG_SPIDER_LAUNCHER_UART_NUM,
+                err = -uart_set_pin(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM,
                                     CONFIG_SPIDER_LAUNCHER_AUDIO_UART_TXD_PIN,
                                     CONFIG_SPIDER_LAUNCHER_AUDIO_UART_RXD_PIN,
                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
@@ -3211,11 +3392,6 @@ static int32_t init(context_t *context)
     audio_play_set_pin(0xF, 0x08, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3, true);
 #  endif
 #endif
-
-        // Initialise tasking, FGR style
-        if (err == ESP_OK) {
-            err = fgr_task_init();
-        }
 
         // Configure WS2812 LED operations needed for debug, FGR style
         if (err == ESP_OK) {
@@ -3349,6 +3525,7 @@ void app_main(void)
 {
     context_t *context = &g_context;
     launcher_t *launcher = &context->launcher;
+    launcher_motor_t *motor = &launcher->motor;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     ESP_LOGI(TAG, "app_main start");
@@ -3360,20 +3537,75 @@ void app_main(void)
         if (nvs_shadow->mute) {
             ESP_LOGI(TAG, "muted, not playing any audio.");
         }
-        while (1) {
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "setting motor to run at 250 mHz.");
+            err = tmc5160_set_velocity(motor->handle, 250);
+        }
+        while (err == ESP_OK) {
             // Let BLE commands do their thing
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            vTaskDelay(pdMS_TO_TICKS(2000));
             esp_task_wdt_reset();
+            uint32_t status;
+            if (tmc5160_read(motor->handle, 0x6f, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "DRV_STATUS 0x%08" PRIx32, status);
+            }
+            if (tmc5160_read(motor->handle, 0x22, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "VACTUAL 0x%08" PRIx32, status);
+            }
+            if (tmc5160_read(motor->handle, 0x21, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "XACTUAL 0x%08" PRIx32, status);
+            }
+            int32_t millihertz;
+            if (tmc5160_get_velocity(motor->handle, &millihertz) == ESP_OK) {
+                ESP_LOGI(TAG, "velocity is now %d milliHertz.", millihertz);
+            }
+#if 0
+            if (tmc5160_read(motor->handle, 0x00, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "GCONF 0x%08" PRIx32, status);
+            }
+            if (tmc5160_read(motor->handle, 0x70, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "PWMCONF 0x%08" PRIx32, status);
+            }
+            if (tmc5160_read(motor->handle, 0x13, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "TPWMTHRS 0x%08" PRIx32, status);
+            }
+            if (tmc5160_read(motor->handle, 0x14, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "TCOOLTHRS 0x%08" PRIx32, status);
+            }
+            if (tmc5160_read(motor->handle, 0x15, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "THIGH 0x%08" PRIx32, status);
+            }
+            if (tmc5160_read(motor->handle, 0x6d, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "COOLCONF 0x%08" PRIx32, status);
+            }
+#endif
         }
         esp_task_wdt_delete(NULL);
+        ESP_LOGE(TAG, "dropped out with error (%s)!", esp_err_to_name(-err));
+        tmc5160_motor_disable(motor->handle);
+        tmc5160_set_velocity(motor->handle, 0);
     } else {
         ESP_LOGE(TAG, "initialization failed, system cannot continue, will restart soonish.");
-        vTaskDelay(pdMS_TO_TICKS(2000));
     }
+    vTaskDelay(pdMS_TO_TICKS(5000));
 
     nimble_port_stop();
     fgr_debug_deinit();
     fgr_ws2812_deinit();
+#if 1
+    if (motor->handle) {
+        tmc5160_motor_disable(motor->handle);
+    }
+    tmc5160_deinit();
+    if (motor->queue_stall) {
+        vQueueDelete(motor->queue_stall);
+    }
+#  if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
+    tmc5160_deinit_stallguard(CONFIG_TMC5160_DIAG_PIN);
+#  endif
+#else
+    motor_deinit();
+#endif
     fgr_task_deinit();
     if (context->command_queue){
         vQueueDelete(context->command_queue);
@@ -3381,7 +3613,7 @@ void app_main(void)
     if (launcher->queue_state){
         vQueueDelete(launcher->queue_state);
     }
-    motor_deinit();
+
     if (context->lock) {
         vSemaphoreDelete(context->lock);
     }
