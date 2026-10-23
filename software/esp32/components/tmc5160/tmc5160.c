@@ -205,7 +205,7 @@ static void print_spi_status(uint8_t spi_status)
         p += print_status_item(spi_status, 1 << x, p, g_spi_status_bit_meaning[x]);
     }
 
-    ESP_LOGI(TAG, "SPI status: %s", buffer);
+    ESP_LOGD(TAG, "SPI status: %s", buffer);
 }
 
 // Perform one 40-bit SPI transaction.  The response byte zero is SPI_STATUS.
@@ -234,7 +234,7 @@ static int32_t transfer(int32_t reg, bool write_access, uint32_t value,
                 *received = ((uint32_t) rx[1] << 24) | ((uint32_t) rx[2] << 16) |
                             ((uint32_t) rx[3] << 8) | rx[4];
             }
-            ESP_LOGI(TAG, "SPI reg 0x%02lx: RX %02x %02x %02x %02x %02x",
+            ESP_LOGD(TAG, "SPI reg 0x%02lx: RX %02x %02x %02x %02x %02x",
                     (unsigned long) reg, rx[0], rx[1], rx[2], rx[3], rx[4]);
             // Print the status byte
             print_spi_status(rx[0]);
@@ -962,6 +962,30 @@ int32_t tmc5160_set_current(stepper_t *stepper,
         }
 
         CONTEXT_UNLOCK(g_context.lock, "tmc5160_set_current()");
+    }
+
+    return err;
+}
+
+// Set the acceleration/deceleration of the stepper motor
+// attached to a TMC5160 device.
+int32_t tmc5160_set_acceleration(stepper_t *stepper,
+                                 uint32_t acceleration)
+{
+    int32_t err = -ESP_ERR_INVALID_STATE;
+
+    if (g_context.spi != NULL) {
+
+        CONTEXT_LOCK(g_context.lock, "tmc5160_set_acceleration()");
+
+        err = -ESP_ERR_INVALID_ARG;
+        if (stepper && (acceleration > 0) &&
+            (acceleration <= 0xFFFF)) {
+            // Write to the AMAX register (0x26)
+            err = write_reg(stepper, 0x26, acceleration);
+        }
+
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_set_acceleration()");
     }
 
     return err;

@@ -243,6 +243,25 @@ int32_t tmc5160_set_current(stepper_t *stepper,
                             uint32_t run_current_ma,
                             uint32_t hold_current_percent);
 
+/** Set the acceleration/deceleration of the stepper motor
+ * attached to a TMC5160 device.
+ *
+ * In velocity mode this controls both acceleration and
+ * deceleration.  Higher values give more abrupt starts
+ * and stops.
+ *
+ * The default value set by tmc5160_create() is 1000.
+ *
+ * @param stepper      the stepper instance that was returned
+ *                     by tmc5160_create().
+ * @param acceleration the value to write to the AMAX register,
+ *                     range 1 to 65535.
+ * @return             zero on success else negative error
+ *                     code from esp_err_t.
+ */
+int32_t tmc5160_set_acceleration(stepper_t *stepper,
+                                 uint32_t acceleration);
+
 /** Set the velocity of the stepper motor attached to a
  * TMC5160 device.
  *
