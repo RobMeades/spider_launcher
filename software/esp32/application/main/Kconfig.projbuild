@@ -1,36 +1,5 @@
 menu "Application Configuration"
 
-    config SPIDER_LAUNCHER_DEBUG_LED_PIN
-        int "Debug LED pin"
-        default 9
-        help
-            The pin where a debug LED is connected
-
-    config SPIDER_LAUNCHER_USE_STEPPER
-        bool
-        default y
-
-    config SPIDER_LAUNCHER_MOTOR_DIRECTION_PIN
-        int "Motor direction pin"
-        default 8
-        depends on !SPIDER_LAUNCHER_USE_STEPPER
-        help
-            Pin wired to the DIR1 pin of the MDD10A motor driver board
-
-    config SPIDER_LAUNCHER_MOTOR_PWM_PIN
-        int "Motor PWM pin"
-        default 7
-        depends on !SPIDER_LAUNCHER_USE_STEPPER
-        help
-            Pin wired to the PWM1 pin of the MDD10A motor driver board
-
-    config SPIDER_LAUNCHER_QRD1114_PIN
-        int "QRD1114 pin"
-        default 6
-        depends on !SPIDER_LAUNCHER_USE_STEPPER
-        help
-            Pin wired to the output of the QRD1114 sensor
-
     config SPIDER_LAUNCHER_AUDIO_USE_GPIO
         bool
         default y if SPIDER_LAUNCHER_AUDIO_UART_NUM < 0

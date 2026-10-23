@@ -32,13 +32,13 @@ menu "TMC5160 Configuration"
 
     config TMC5160_ENABLE_PIN
         int "stepper enable pin"
-        default 3
+        default 9
         help
             Pin connected to the TMC5160 EN pin
 
     config TMC5160_DIAG_PIN
         int "DIAG pin for stepper motor control"
-        default 2
+        default -1
         help
             Pin connected to the TMC5160 DIAG pin, use -1 if there is none.
 

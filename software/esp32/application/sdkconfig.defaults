@@ -29,9 +29,9 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 # Force an 8 Mbyte flash size, in case of misdetection
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 
-# multi-colour LED on GPIO 9
+# multi-colour LED on GPIO 3
 CONFIG_FGR_DEBUG_LED_WS2812_GRB=y
-CONFIG_FGR_DEBUG_LED_PIN=9
+CONFIG_FGR_DEBUG_LED_PIN=3
 
 # PSRAM configuration for Seeed Studio boards
 CONFIG_SPIRAM_MODE_OCT=y

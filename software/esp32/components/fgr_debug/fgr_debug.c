@@ -320,6 +320,9 @@ int32_t fgr_debug_init()
             if (err == ESP_OK) {
                 // Flash the LED so that we know it can be active
                 fgr_debug_led_flash(FGR_DEBUG_LED_LONG_MS, FGR_DEBUG_LED_COLOUR_BOOT);
+#if defined(CONFIG_FGR_DEBUG_LED_PIN) && (CONFIG_FGR_DEBUG_LED_PIN >= 0)
+                ESP_LOGI(TAG, "debug LED active on pin %d", CONFIG_FGR_DEBUG_LED_PIN);
+#endif
             }
         }
     }

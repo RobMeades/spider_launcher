@@ -53,9 +53,31 @@
 // The maximum value of IRUN or IHOLD, which are 5-bit values.
 #define IRUN_OR_IHOLD_MAX 31
 
+// Default value for the VSTART register
+#define VSTART_DEFAULT 0
+
+// Default value for the A1 register
+#define A1_DEFAULT 1000
+
+// Default value for the V1 register
+#define V1_DEFAULT 0
+
+// Default value for the V1 register
+#define V1_DEFAULT 0
+
 // Default value for the AMAX register
 #define AMAX_DEFAULT 1000
 
+// Default value for the DMAX register
+#define DMAX_DEFAULT 1000
+
+// Default value for the D1 register
+#define D1_DEFAULT 1000
+
+// Default value for the VSTOP register
+#define VSTOP_DEFAULT 10
+
+// Default values for Stealth Chop
 #define STEALTH_CHOP_PWMCONF 0xC40C001EU
 #define STEALTH_CHOP_CALIBRATION_MS 1000
 
@@ -416,6 +438,36 @@ static int32_t get_microstep_resolution(stepper_t *stepper,
     return err;
 }
 
+// Get the VMAX value for a given velocity
+// IMPORTANT the context should be locked before this is called.
+static int32_t millihertz_to_vmax(stepper_t *stepper, int32_t millihertz, uint32_t *vmax)
+{
+    int32_t err = -ESP_ERR_INVALID_ARG;
+
+    if (vmax) {
+        // Read the microstep resolution
+        int32_t microstep_resolution;
+        err = get_microstep_resolution(stepper, &microstep_resolution);
+        if (err == ESP_OK) {
+            // VMAX takes an unsigned magnitude; RAMPMODE determines direction.
+            uint64_t velocity = (millihertz < 0) ?
+                                (uint32_t) (-(int64_t) millihertz) :
+                                (uint32_t) millihertz;
+            uint64_t _vmax = (velocity *
+                              MOTOR_STEPS_PER_REV * microstep_resolution *
+                              (1ULL << 24)) / (1000ULL * TMC5160_CLOCK_HZ);
+
+            if (_vmax <= 0x007fffffULL) {
+                *vmax = (uint32_t) _vmax;
+            } else {
+                err = -ESP_ERR_INVALID_ARG;
+            }
+        }
+    }
+
+    return err;
+}
+
 /* ----------------------------------------------------------------
  * PUBLIC FUNCTIONS
  * -------------------------------------------------------------- */
@@ -513,31 +565,43 @@ stepper_t *tmc5160_create(int32_t address, int32_t enable_pin)
                 err = get_version(stepper);
                 if (err >= 0) {
                     if (err == TMC5160_VERSION) {
-                        // Clear bit 0 of GSTAT t(0x01) to clear reset
-                        err = write_reg(stepper, 0x01, 0x01);
-                        if (err >= 0) {
-                            // Read the GCONF register to prove it is there
-                            uint32_t data;
-                            err = read_reg(stepper, 0, &data);
-                            if (err == ESP_OK) {
-                                ESP_LOGI(TAG, "TMC5160 started, GCONF is 0x%08x.", data);
-                            } else {
-                                ESP_LOGE(TAG, "failed to read GCONF register (%s)!", esp_err_to_name(-err));
-                                err = -ESP_ERR_NOT_FOUND;
-                            }
-                            if (err == ESP_OK) {
-                                // Set an initial acceleration value in AMAX (0x26)
-                                err = write_reg(stepper, 0x26, AMAX_DEFAULT);
-                                if (err == ESP_OK) {
-                                    ESP_LOGI(TAG, "AMAX set to %d.", AMAX_DEFAULT);
-                                } else {
-                                    ESP_LOGE(TAG, "unable to set AMAX to %d (%s)!", AMAX_DEFAULT,
-                                             esp_err_to_name(-err));
-                                    err = -ESP_ERR_NOT_FOUND;
-                                }
-                            }
+                        // Read the GCONF register to prove it is there
+                        uint32_t data;
+                        err = read_reg(stepper, 0, &data);
+                        if (err == ESP_OK) {
+                            ESP_LOGI(TAG, "TMC5160 started, GCONF is 0x%08x.", data);
                         } else {
-                            ESP_LOGE(TAG, "failed to write GSTAT (%s)!", esp_err_to_name(-err));
+                            ESP_LOGE(TAG, "failed to read GCONF register (%s)!", esp_err_to_name(-err));
+                            err = -ESP_ERR_NOT_FOUND;
+                        }
+                        if (err == ESP_OK) {
+                            // Configure the positioning ramp generator registers
+                            // VSTART (0x23)
+                            err = write_reg(stepper, 0x23, VSTART_DEFAULT);
+                            if (err == ESP_OK) {
+                                // A1 (0x24)
+                                err = write_reg(stepper, 0x24, A1_DEFAULT);
+                            }
+                            if (err == ESP_OK) {
+                                // V1 (0x25)
+                                err = write_reg(stepper, 0x25, V1_DEFAULT);
+                            }
+                            if (err == ESP_OK) {
+                                // AMAX (0x26)
+                                err = write_reg(stepper, 0x26, AMAX_DEFAULT);
+                            }
+                            if (err == ESP_OK) {
+                                // DMAX (0x28)
+                                err = write_reg(stepper, 0x28, DMAX_DEFAULT);
+                            }
+                            if (err == ESP_OK) {
+                                // D1 (0x2A)
+                                err = write_reg(stepper, 0x2a, D1_DEFAULT);
+                            }
+                            if (err == ESP_OK) {
+                                // VSTOP (0x2b)
+                                err = write_reg(stepper, 0x2b, VSTOP_DEFAULT);
+                            }
                         }
                     } else {
                         ESP_LOGE(TAG, "TMC5160 returned version 0x%02x when 0x%02x was expected!",
@@ -578,10 +642,81 @@ void tmc5160_destroy(stepper_t *stepper)
     }
 }
 
+// Deinitialise the TMC5160 driver.
+void tmc5160_deinit()
+{
+    if (g_context.spi != NULL) {
+
+        CONTEXT_LOCK(g_context.lock, "tmc5160_deinit()");
+
+        while (!SLIST_EMPTY(&g_context.stepper_list)) {
+            stepper_t *p = SLIST_FIRST(&g_context.stepper_list);
+            clean_up(p);
+        }
+
+        spi_bus_remove_device(g_context.spi);
+        g_context.spi = NULL;
+        if (g_context.bus_initialised) {
+            spi_bus_free(g_context.spi_host);
+            g_context.bus_initialised = false;
+        }
+
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_deinit()");
+
+    }
+
+    // The semaphore will be re-used
+}
+
+// Determine if the TMC5160 has reset.
+bool tmc5160_has_reset(stepper_t *stepper)
+{
+    bool has_reset = true;  // Failure to read a register treated as a reset
+
+    if (g_context.spi != NULL) {
+
+        CONTEXT_LOCK(g_context.lock, "tmc5160_has_reset()");
+
+        // Read GSTAT (0x01)
+        uint32_t data;
+        int32_t err = read_reg(stepper, 0x01, &data);
+        if (err == ESP_OK) {
+            // Bit 0 indicates reset
+            has_reset = (data & 0x01) > 0;
+        }
+
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_has_reset()");
+    }
+
+    return has_reset;
+}
+
+// Acknowledge the reset bit
+int32_t tmc5160_acknowledge_reset(stepper_t *stepper)
+{
+    int32_t err = -ESP_ERR_INVALID_STATE;
+
+    if (g_context.spi != NULL) {
+
+        CONTEXT_LOCK(g_context.lock, "tmc5160_acknowledge_reset()");
+
+        // Reset the reset bit (bit 0) in GSTAT (0x01)
+        err = write_reg(stepper, 0x01, 0x01);
+        if (err < 0) {
+            ESP_LOGE(TAG, "failed to write GSTAT (%s)!", esp_err_to_name(-err));
+        }
+
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_acknowledge_reset()");
+    }
+
+    return err;
+}
+
 // Set the motor enable pin low to enable motors.
 int32_t tmc5160_motor_enable(stepper_t *stepper)
 {
     int32_t err = -ESP_ERR_INVALID_STATE;
+
     if (g_context.spi != NULL) {
 
         CONTEXT_LOCK(g_context.lock, "tmc5160_motor_enable()");
@@ -610,7 +745,6 @@ int32_t tmc5160_motor_enable(stepper_t *stepper)
         }
 
         CONTEXT_UNLOCK(g_context.lock, "tmc5160_motor_enable()");
-
     }
 
     return err;
@@ -635,32 +769,6 @@ int32_t tmc5160_motor_disable(stepper_t *stepper)
     }
 
     return err;
-}
-
-// Deinitialise the TMC5160 driver.
-void tmc5160_deinit()
-{
-    if (g_context.spi != NULL) {
-
-        CONTEXT_LOCK(g_context.lock, "tmc5160_deinit()");
-
-        while (!SLIST_EMPTY(&g_context.stepper_list)) {
-            stepper_t *p = SLIST_FIRST(&g_context.stepper_list);
-            clean_up(p);
-        }
-
-        spi_bus_remove_device(g_context.spi);
-        g_context.spi = NULL;
-        if (g_context.bus_initialised) {
-            spi_bus_free(g_context.spi_host);
-            g_context.bus_initialised = false;
-        }
-
-        CONTEXT_UNLOCK(g_context.lock, "tmc5160_deinit()");
-
-    }
-
-    // The semaphore will be re-used
 }
 
 // Write a buffer of data to the given register of the TMC5160 at
@@ -716,28 +824,6 @@ int32_t tmc5160_read_lines(stepper_t *stepper)
         }
 
         CONTEXT_UNLOCK(g_context.lock, "tmc5160_read_lines()");
-    }
-
-    return err;
-}
-
-// Read the microstep counter of a TMC5160.
-int32_t tmc5160_get_position(stepper_t *stepper)
-{
-    int32_t err = -ESP_ERR_INVALID_STATE;
-
-    if (g_context.spi != NULL) {
-
-        CONTEXT_LOCK(g_context.lock, "tmc5160_get_position()");
-
-        // Read the MSCNT register (0x6a)
-        uint32_t data;
-        err = read_reg(stepper, 0x6a, &data);
-        if (err == ESP_OK) {
-            err = data;
-        }
-
-        CONTEXT_UNLOCK(g_context.lock, "tmc5160_get_position()");
     }
 
     return err;
@@ -891,28 +977,15 @@ int32_t tmc5160_set_velocity(stepper_t *stepper, int32_t millihertz)
 
         CONTEXT_LOCK(g_context.lock, "tmc5160_set_velocity()");
 
-        // Read the microstep resolution
-        int32_t microstep_resolution;
-        err = get_microstep_resolution(stepper, &microstep_resolution);
+        uint32_t vmax;
+        err =  millihertz_to_vmax(stepper, millihertz, &vmax);
         if (err == ESP_OK) {
-            // VMAX takes an unsigned magnitude; RAMPMODE determines direction.
-            uint64_t velocity = (millihertz < 0) ?
-                                (uint32_t) (-(int64_t) millihertz) :
-                                (uint32_t) millihertz;
-
-            uint32_t vmax = (uint32_t) ((velocity *
-                                        MOTOR_STEPS_PER_REV * microstep_resolution *
-                                        (1ULL << 24)) / (1000ULL * TMC5160_CLOCK_HZ));
-            if (vmax > 0x007fffffULL) {
-                err = -ESP_ERR_INVALID_ARG;
-            } else {
-                // Write to the VMAX register (0x27)
-                err = write_reg(stepper, 0x27, vmax);  // VMAX
-                if (err == ESP_OK) {
-                    // Write to the RAMPMODE register (0x20)
-                    err = write_reg(stepper, 0x20,
-                                    millihertz < 0 ? 2U : 1U);  // RAMPMODE
-                }
+            // Write to the VMAX register (0x27)
+            err = write_reg(stepper, 0x27, vmax);
+            if (err == ESP_OK) {
+                // Write to the RAMPMODE register (0x20)
+                err = write_reg(stepper, 0x20,
+                                millihertz < 0 ? 2U : 1U);
             }
         }
 
@@ -932,32 +1005,94 @@ int32_t tmc5160_get_velocity(stepper_t *stepper, int32_t *millihertz)
 
         CONTEXT_LOCK(g_context.lock, "tmc5160_get_velocity()");
 
-        // Read the microstep resolution
-        int32_t microstep_resolution;
-        err = get_microstep_resolution(stepper, &microstep_resolution);
-        if (err == ESP_OK) {
-            // Read the VACTUAL register
-            uint32_t data;
-            err = read_reg(stepper, 0x22, &data);
+        err = -ESP_ERR_INVALID_ARG;
+        // read_reg() checks the validity of stepper
+        if (millihertz) {
+            // Read the microstep resolution
+            int32_t microstep_resolution;
+            err = get_microstep_resolution(stepper, &microstep_resolution);
             if (err == ESP_OK) {
-                uint32_t raw = data & 0x00ffffffU;
+                // Read the VACTUAL register
+                uint32_t data;
+                err = read_reg(stepper, 0x22, &data);
+                if (err == ESP_OK) {
+                    // Since VACTUAL is a signed value of length 24 bits,
+                    // need to sign extend it manually
+                    int32_t vactual = (int32_t) (data & 0x007fffffU) -
+                                    (int32_t) (data & 0x00800000U);
+                    int64_t numerator = ((int64_t) vactual) * TMC5160_CLOCK_HZ * 1000;
+                    int64_t denominator = (1LL << 24) *
+                                        MOTOR_STEPS_PER_REV *
+                                        microstep_resolution;
 
-                // Since VACTUAL is a signed value of length 24 bits,
-                // need to sign extend it manually
-                int32_t vactual = (int32_t) (data & 0x007fffffU) -
-                                  (int32_t) (data & 0x00800000U);
-                int64_t numerator = ((int64_t) vactual) * TMC5160_CLOCK_HZ * 1000;
-                int64_t denominator = (1LL << 24) *
-                                      MOTOR_STEPS_PER_REV *
-                                      microstep_resolution;
-
-                *millihertz = numerator / denominator;
+                    *millihertz = numerator / denominator;
+                }
             }
         }
 
         CONTEXT_UNLOCK(g_context.lock, "tmc5160_get_velocity()");
-
     }
+    return err;
+}
+
+// Set the target position of a TMC5160, in microsteps.
+int32_t tmc5160_set_position(stepper_t *stepper, int32_t microsteps,
+                             uint32_t max_velocity_millihertz)
+{
+    int32_t err = -ESP_ERR_INVALID_STATE;
+
+    if (g_context.spi != NULL) {
+
+        CONTEXT_LOCK(g_context.lock, "tmc5160_set_position()");
+
+        err = -ESP_ERR_INVALID_ARG;
+        if (max_velocity_millihertz <= INT32_MAX) {
+            uint32_t vmax;
+            err =  millihertz_to_vmax(stepper, (int32_t) max_velocity_millihertz, &vmax);
+            if (err == ESP_OK) {
+                // Order is important here
+                // Set target position in XTARGET (0x2d)
+                err = write_reg(stepper, 0x2d, (uint32_t) microsteps);
+                if (err == ESP_OK) {
+                    // Write to the VMAX register (0x27)
+                    err = write_reg(stepper, 0x27, vmax);
+                }
+                if (err == ESP_OK) {
+                    // Select positioning mode in RAMPMODE (0x20)
+                    err = write_reg(stepper, 0x20, 0);
+                }
+            }
+        }
+
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_set_position()");
+    }
+
+    return err;
+}
+
+// Read the position of a TMC5160, in microsteps.
+int32_t tmc5160_get_position(stepper_t *stepper, int32_t *microsteps)
+{
+    int32_t err = -ESP_ERR_INVALID_STATE;
+
+    if (g_context.spi != NULL) {
+
+        CONTEXT_LOCK(g_context.lock, "tmc5160_get_position()");
+
+        err = -ESP_ERR_INVALID_ARG;
+        // read_reg() checks the validity of stepper
+        if (microsteps) {
+            uint32_t data;
+            // Read XACTUAL (0x21)
+            err = read_reg(stepper, 0x21, &data);
+            if (err == ESP_OK) {
+                *microsteps = (int32_t) data;
+            }
+        }
+
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_get_position()");
+    }
+
     return err;
 }
 
@@ -1084,8 +1219,8 @@ int32_t tmc5160_get_tstep(stepper_t *stepper)
         if (err == ESP_OK) {
             err = data;
         }
-        CONTEXT_UNLOCK(g_context.lock, "tmc5160_get_tstep()");
 
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_get_tstep()");
     }
 
     return err;

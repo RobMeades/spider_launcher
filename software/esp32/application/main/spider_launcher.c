@@ -45,6 +45,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
 #include "esp_err.h"
@@ -95,6 +96,9 @@
 // UART buffer.
 #define UART_RX_BUFFFER_SIZE 256
 
+// The diameter of the winch in millimetres
+#define WINCH_DIAMETER_MM 100
+
 // TMC5160 stepper motor controller address.
 #define TMC5160_ADDRESS 0
 
@@ -114,11 +118,14 @@
 // HEND time for the stepper motor, see tmc5160_configure_chopper().
 #define TMC5160_HEND -2
 
+// The step resolution for the motor.
+#define TMC5160_STEPS_PER_REVOLUTION 200
+
 // The microstep resolution for the motor (1 to 256 in powers of two).
 #define TMC5160_MICROSTEP_RESOLUTION 256
 
 // How much current to feed to the stepper motor when running.
-#define TMC5160_RUN_CURRENT_MA 1200
+#define TMC5160_RUN_CURRENT_MA 500
 
 // The percentage to apply to the run current when holding.
 #define TMC5160_HOLD_CURRENT_PERCENT 50
@@ -177,7 +184,7 @@
 #define DEFAULT_HEIGHT_MAX_MM 2000
 
 // Default value for "speed".
-#define DEFAULT_SPEED_MM_PER_SECOND 6000
+#define DEFAULT_SPEED_MM_PER_SECOND 500
 
 // Default value for "track number skittering".
 #define DEFAULT_TRACK_NUMBER_SKITTERING 5
@@ -198,23 +205,13 @@
 #define DEFAULT_MUTE false
 
 // An out of range value to represent an unknown step count
-#define STEP_UNKNOWN 0x7FFFFFFF
+#define POSITION_UNKNOWN 0x7FFFFFFF
 
-// How many mm of height is represented by one step (i.e. the distance
-// between two QRD1114 sensor pulses).
-#define QRD1114_STEP_LENGTH_MM  40
-
-// The speed in mm per second of winch movement that matches 100% PWM.
-#define SPEED_MAX_MM_PER_SECOND 8000
+// A maximum speed.
+#define SPEED_MAX_MM_PER_SECOND 1000
 
 // The minimum usable speed in mm per second.
-#define SPEED_MIN_MM_PER_SECOND 2500
-
-// The speed value to hold the winch in position.
-#define SPEED_HOLD_MM_PER_SECOND 1000
-
-// The PWM hold percentage.
-#define PWM_HOLD_PERCENT (100 * (SPEED_HOLD_MM_PER_SECOND) / (SPEED_MAX_MM_PER_SECOND))
+#define SPEED_MIN_MM_PER_SECOND 40
 
 #if DEFAULT_SPEED_MM_PER_SECOND < SPEED_MIN_MM_PER_SECOND
 #  error "DEFAULT_SPEED_MM_PER_SECOND must be at least SPEED_MIN_MM_PER_SECOND"
@@ -222,6 +219,9 @@
 
 // How long to spend joggling the spider to wake it up.
 #define WAKING_DURATION_MS 1000
+
+// How high a step to take to jiggle the spider away during waking
+#define WAKING_JIGGLE_HEIGHT_MM 50
 
 // How long to pause between joggles when waking the spider.
 #define WAKING_STOP_MS 250
@@ -252,12 +252,15 @@
 #define AUTO_MODE_RETRY_TIME_SECONDS 5
 
 // Defaults for the retained_ram_t structure.
-#define DEFAULTS_RETAINED_RAM {.step_current = STEP_UNKNOWN,             \
-                               .step_ground_level = STEP_UNKNOWN,        \
+#define DEFAULTS_RETAINED_RAM {.ground_level_mm = POSITION_UNKNOWN,   \
                                .emergency_stopped = false}
 
 // The colour for the debug LED if we are emergency stopped.
 #define DEBUG_LED_COLOUR_EMERGENCY_STOPPED FGR_WS2812_LED_COLOUR_WHITE
+
+// Pi approximated as 3141593 / 1000000.
+#define PI_NUMERATOR        3141593LL
+#define PI_DENOMINATOR      1000000LL
 
 /* ----------------------------------------------------------------
  * TYPES
@@ -305,7 +308,7 @@ typedef enum {
 // g_launcher_state_name[] to match.
 typedef enum {
     LAUNCHER_STATE_NULL = 0,
-    LAUNCHER_STATE_HEIGHT_UNKNOWN,
+    LAUNCHER_STATE_POSITION_UNKNOWN,
     LAUNCHER_STATE_READY,
     LAUNCHER_STATE_MOVE_UP,
     LAUNCHER_STATE_MOVE_DOWN,
@@ -343,20 +346,9 @@ typedef struct {
 
 // Structure to hold motor data
 typedef struct {
-#if 1
     stepper_t *handle;
     TaskHandle_t task_stall;
     QueueHandle_t queue_stall;
-#else
-    motor_t *handle;
-    int32_t pwm;
-    volatile bool sensor_trigger_last_populated;
-    volatile int64_t sensor_trigger_last_us;
-    volatile int64_t sensor_interval_buffer_us[8];  // 8 intervals = one rotation
-    volatile size_t sensor_interval_buffer_index;
-    volatile size_t sensor_interval_buffer_num_entries;
-    volatile int64_t sensor_interval_buffer_total_us;
-#endif
 } launcher_motor_t;
 
 // The launcher context
@@ -364,7 +356,7 @@ typedef struct {
     QueueHandle_t queue_state;
     TaskHandle_t task_state;
     launcher_state_t state;
-    int32_t step_target;
+    int32_t height_target_mm;
     bool direction_up_not_down;
     launcher_timer_t timer_a;
     launcher_timer_t timer_b;
@@ -397,8 +389,7 @@ typedef struct {
 // Retained RAM storage.  If you update this structure, you
 // also need to update DEFAULTS_RETAINED_RAM above.
 typedef struct {
-    int32_t step_ground_level;
-    int32_t step_current;
+    int32_t ground_level_mm;
     bool emergency_stopped;
 } retained_ram_t;
 
@@ -437,7 +428,7 @@ static const struct ble_gap_adv_params g_ble_adv_params = {
 // Context for the whole application (fields not mentioned will be zeroed).
 static context_t g_context = {.service_uuid = BLE_UUID16_INIT(SERVICE_UUID),
                               .ble_connection_handle = BLE_HS_CONN_HANDLE_NONE,
-                              .launcher.step_target = STEP_UNKNOWN};
+                              .launcher.height_target_mm = POSITION_UNKNOWN};
 
 // Retained RAM storage
 FGR_RRAM_DEFINE(retained_ram_t, retained_ram);
@@ -446,7 +437,7 @@ FGR_RRAM_DEFINE(retained_ram_t, retained_ram);
 // entries are in the same order as launcher_state_t
 // and there must be the same number of entries
 static const char *g_launcher_state_name[] = {"NULL",
-                                              "HEIGHT_UNKNOWN",
+                                              "POSITION_UNKNOWN",
                                               "READY",
                                               "MOVE_UP",
                                               "MOVE_DOWN",
@@ -464,7 +455,7 @@ _Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_name) == LAUNCHER_STATE_N
 
 // Table of launcher states to LED colours
 static const fgr_ws2812_colour_t g_launcher_state_colour[] = {FGR_WS2812_LED_COLOUR_WHITE,      // NULL
-                                                              FGR_WS2812_LED_COLOUR_CYAN,       // HEIGHT_UNKNOWN
+                                                              FGR_WS2812_LED_COLOUR_CYAN,       // POSITION_UNKNOWN
                                                               FGR_WS2812_LED_COLOUR_GREEN,      // READY
                                                               FGR_WS2812_LED_COLOUR_YELLOW,     // MOVE_UP
                                                               FGR_WS2812_LED_COLOUR_YELLOW,     // MOVE_DOWN
@@ -1152,14 +1143,55 @@ static void ble_task(void *param)
  * STATIC FUNCTIONS: MOTOR RELATED
  * -------------------------------------------------------------- */
 
-#if 1
+// Convert height in mm to motor microsteps.
+static int32_t height_to_microsteps(int32_t height_mm)
+{
+    int64_t numerator = (int64_t) height_mm *
+                        TMC5160_STEPS_PER_REVOLUTION *
+                        TMC5160_MICROSTEP_RESOLUTION *
+                        PI_DENOMINATOR;
+    int64_t denominator = (int64_t) WINCH_DIAMETER_MM * PI_NUMERATOR;
 
-# if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
+    // Round to nearest microstep, including negative values.
+    return (int32_t) ((numerator +
+                       (numerator >= 0 ? denominator / 2 : -denominator / 2)) /
+                      denominator);
+}
+
+// Convert motor microsteps to height in mm.
+static int32_t microsteps_to_mm(int32_t microsteps)
+{
+    int64_t numerator = (int64_t) microsteps *
+                        WINCH_DIAMETER_MM *
+                        PI_NUMERATOR;
+    int64_t denominator = (int64_t) TMC5160_STEPS_PER_REVOLUTION *
+                          TMC5160_MICROSTEP_RESOLUTION *
+                          PI_DENOMINATOR;
+
+    // Round to nearest mm, including negative values.
+    return (int32_t) ((numerator +
+                       (numerator >= 0 ? denominator / 2 : -denominator / 2)) /
+                      denominator);
+}
+
+// Convert linear speed in mm/s to motor rotational speed in milliHertz.
+static int32_t speed_mm_per_second_to_millihertz(int32_t speed_mm_per_second)
+{
+    int64_t numerator = (int64_t) speed_mm_per_second * 1000 * PI_DENOMINATOR;
+    int64_t denominator = (int64_t) WINCH_DIAMETER_MM * PI_NUMERATOR;
+
+    // Round to nearest milliHertz, including negative values.
+    return (int32_t) ((numerator +
+                       (numerator >= 0 ? denominator / 2 : -denominator / 2)) /
+                      denominator);
+}
+
+#if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
 // Stall interrupt handler,
 static void motor_stall_interrupt_handler(void *arg)
 {
     launcher_motor_t *motor = (launcher_motor_t *) arg;
-    BaseType_t higherPriorityTaskWoken;
+    BaseType_t higherPriorityTaskWoken = pdFALSE;
 
     if (motor->task_stall && motor->queue_stall) {
         uint8_t empty = 0;
@@ -1167,7 +1199,7 @@ static void motor_stall_interrupt_handler(void *arg)
         portYIELD_FROM_ISR(higherPriorityTaskWoken);
     }
 }
-# endif
+#endif
 
 // Callback to be run in task context to handle stall indications.
 static void motor_stall_task_cb(void *handle, void *arg)
@@ -1182,186 +1214,88 @@ static void motor_stall_task_cb(void *handle, void *arg)
     }
 }
 
-#else
-// Reset the motor sensor interval averaging buffer; call this when changing speed.
-static void motor_reset_buffer(launcher_motor_t *motor)
+// Get the current position from the motor.
+static int32_t motor_get_position_mm(launcher_motor_t *motor)
 {
-    motor->sensor_interval_buffer_num_entries = 0;
-    motor->sensor_interval_buffer_index = 0;
-    motor->sensor_interval_buffer_total_us = 0;
-    memset((void *) motor->sensor_interval_buffer_us, 0, sizeof(motor->sensor_interval_buffer_us));
-}
+    int32_t position_mm = POSITION_UNKNOWN;
 
-// Return whether the motor is being driven.
-static bool motor_is_driven(launcher_motor_t *motor)
-{
-    return (motor->pwm < -PWM_HOLD_PERCENT) || (motor->pwm > PWM_HOLD_PERCENT);
-}
-
-// Get the average sensor interval of the motor.
-static int64_t motor_sensor_interval_average_us(launcher_motor_t *motor)
-{
-    int64_t sensor_interval_average_us = 0;
-
-    if (motor->sensor_interval_buffer_num_entries > 0) {
-        sensor_interval_average_us = motor->sensor_interval_buffer_total_us / motor->sensor_interval_buffer_num_entries;
+    // Read the current position from the TMC5160
+    int32_t microsteps;
+    int32_t err = tmc5160_get_position(motor->handle, &microsteps);
+    if ((err == ESP_OK) && !tmc5160_has_reset(motor->handle)) {
+        // Convert to a position in mm
+        position_mm = microsteps_to_mm(microsteps);
     }
 
-    return sensor_interval_average_us;
+    return position_mm;
 }
 
-// Get the actual absolute speed of the motor in mm/second.
-static int32_t motor_abs_speed_mm_per_second(launcher_motor_t *motor)
+// Start the motor moving at the given speed.
+static void motor_set_speed(launcher_motor_t *motor, bool direction_up_not_down,
+                            uint32_t abs_speed_mm_per_second,
+                            uint32_t speed_modifier_percent)
 {
-    int32_t abs_speed_mm_per_second = 0;
-    int64_t sensor_interval_average_us = motor_sensor_interval_average_us(motor);
-
-    if (sensor_interval_average_us > 0) {
-        abs_speed_mm_per_second = (int32_t) (((int64_t) QRD1114_STEP_LENGTH_MM) * 1000000 / sensor_interval_average_us);
-    }
-
-    return abs_speed_mm_per_second;
-}
-#endif
-
-// Start the motor speed in the given direction.
-static void motor_start(launcher_motor_t *motor, bool direction_up_not_down,
-                        uint32_t abs_speed_mm_per_second,
-                        uint32_t speed_modifier_percent)
-{
-#if 1
-    (void) motor;
-    (void) direction_up_not_down;
-    (void) abs_speed_mm_per_second;
-    (void) speed_modifier_percent;
-#else
-    int32_t speed_mm_per_second = (int32_t) abs_speed_mm_per_second * speed_modifier_percent / 100;
-
-    // Don't allow stupidly low speeds as we may think the motor
-    // has the hold PWM applied
-    if (speed_mm_per_second < SPEED_MIN_MM_PER_SECOND) {
-        speed_mm_per_second = SPEED_MIN_MM_PER_SECOND;
-    }
-
+    int32_t speed_mm_per_second = abs_speed_mm_per_second * speed_modifier_percent / 100;
     if (!direction_up_not_down) {
         speed_mm_per_second = -speed_mm_per_second;
     }
-    int32_t pwm = 100 * speed_mm_per_second / SPEED_MAX_MM_PER_SECOND;
 
-    if (pwm != motor->pwm) {
-        motor_reset_buffer(motor);
-    }
-    int32_t err = motor_speed_set(motor->handle, pwm);
+    // Make sure the motor is enabled
+    int32_t err = tmc5160_motor_enable(motor->handle);
     if (err == ESP_OK) {
-        motor->pwm = pwm;
-        ESP_LOGI(TAG, "speed set to %d mm/s (pwm %d%%).",
-                 speed_mm_per_second, pwm);
+        int32_t millihertz = speed_mm_per_second_to_millihertz(speed_mm_per_second);
+        int32_t err = tmc5160_set_velocity(motor->handle, millihertz);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "speed set to %d mm/s (%d milliHertz).", speed_mm_per_second, millihertz);
+        } else {
+            ESP_LOGE(TAG, "unable to set speed to %d mm/s (%d milliHertz) (%s).",
+                     speed_mm_per_second, millihertz, esp_err_to_name(-err));
+        }
     } else {
-        ESP_LOGE(TAG, "unable to set speed to %d mm/s (pwm %d%%) (%s).",
-                 speed_mm_per_second, pwm, esp_err_to_name(-err));
+        ESP_LOGE(TAG, "unable to enable motor (%s).", esp_err_to_name(-err));
     }
-#endif
+}
+
+// Move the winch to the given height.
+static void motor_set_height_mm(launcher_motor_t *motor, uint32_t height_mm,
+                                uint32_t abs_speed_mm_per_second,
+                                int32_t ground_level_mm)
+{
+    int32_t position_mm = ground_level_mm + height_mm;
+    int32_t microsteps = height_to_microsteps(position_mm);
+    int32_t abs_speed_millihertz = speed_mm_per_second_to_millihertz(abs_speed_mm_per_second);
+
+    // Make sure the motor is enabled
+    int32_t err = tmc5160_motor_enable(motor->handle);
+    if (err == ESP_OK) {
+        err = tmc5160_set_position(motor->handle, microsteps, abs_speed_millihertz);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "target height set to %d mm (%d microsteps),"
+                    "max speed %d mm/second (%d milliHertz).", height_mm, microsteps,
+                    abs_speed_mm_per_second, abs_speed_millihertz);
+        } else {
+            ESP_LOGE(TAG, "unable to set target height to %d mm (%d microsteps) (%s).",
+                    height_mm, microsteps, esp_err_to_name(-err));
+        }
+    } else {
+        ESP_LOGE(TAG, "unable to enable motor (%s).", esp_err_to_name(-err));
+    }
 }
 
 // Stop the motor.
 static void motor_stop(launcher_motor_t *motor, bool and_hold)
 {
-#if 1
-    (void) motor;
-    (void) and_hold;
-#else
-    int32_t pwm = 0;
-    if (and_hold) {
-        pwm = PWM_HOLD_PERCENT;
+    int32_t err = tmc5160_set_velocity(motor->handle, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "unable to stop the motor (%s).", esp_err_to_name(-err));
     }
-
-    bool was_driven = motor_is_driven(motor);
-    if (was_driven) {
-        // Can't do this accurately - just busy wait until the sensor is
-        // not triggered, with a guard
-        size_t guard = 0;
-        while (motor_sensor_is_triggered(motor->handle) && (guard < 5000)) {
-            esp_rom_delay_us(1);
-            guard++;
+    if (!and_hold) {
+        err = tmc5160_motor_disable(motor->handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "unable to disable motor (%s).", esp_err_to_name(-err));
         }
     }
-    int32_t err = motor_speed_set(motor->handle, pwm);
-    if (err == ESP_OK) {
-        if (was_driven) {
-            // Calculate what the actual speed was previously for information
-            int32_t speed_mm_per_second = motor_abs_speed_mm_per_second(motor);
-            ESP_LOGI(TAG, "motor stopped, absolute actual speed was %d mm/second%s.",
-                     speed_mm_per_second,
-                     motor_sensor_is_triggered(motor->handle) ? ", sensor is currently triggered" : "");
-        } else {
-            ESP_LOGI(TAG, "motor stopped%s.",
-                     motor_sensor_is_triggered(motor->handle) ? ", sensor is currently triggered" : "");
-        }
-        motor_reset_buffer(motor);
-        motor->pwm = pwm;
-    } else {
-        ESP_LOGE(TAG, "unable to stop motor (%s).", esp_err_to_name(-err));
-    }
-#endif
 }
-
-#if 1
-#else
-// Callback called each time the QRD1114 sensor on the motor is triggered.
-static void motor_cb(motor_t *unused, void *param)
-{
-    launcher_motor_t *motor = (launcher_motor_t *) param;
-    int64_t sensor_interval_time_us = 0;
-    bool driven = false;
-
-    (void) unused;
-
-    // If we're being driven, measure the distance between sensor triggers
-    if (motor_is_driven(motor)) {
-        driven = true;
-        if (motor->sensor_trigger_last_populated) {
-            int64_t now = esp_timer_get_time();
-            sensor_interval_time_us = now - motor->sensor_trigger_last_us;
-            motor->sensor_trigger_last_us = now;
-            // Replace the oldest value in the total
-            motor->sensor_interval_buffer_total_us -= motor->sensor_interval_buffer_us[motor->sensor_interval_buffer_index];
-            motor->sensor_interval_buffer_total_us += sensor_interval_time_us;
-            // Replace the oldest value in the buffer and move the index on
-            motor->sensor_interval_buffer_us[motor->sensor_interval_buffer_index] = sensor_interval_time_us;
-            motor->sensor_interval_buffer_index = (motor->sensor_interval_buffer_index + 1) % FGR_UTIL_ARRAY_LENGTH(motor->sensor_interval_buffer_us);
-            // Keep track of the number of entries in the buffer so that we can work out the average
-            motor->sensor_interval_buffer_num_entries++;
-            if (motor->sensor_interval_buffer_num_entries > FGR_UTIL_ARRAY_LENGTH(motor->sensor_interval_buffer_us)) {
-                motor->sensor_interval_buffer_num_entries = FGR_UTIL_ARRAY_LENGTH(motor->sensor_interval_buffer_us);
-            }
-        } else {
-            motor->sensor_trigger_last_us = esp_timer_get_time();
-            motor->sensor_trigger_last_populated = true;
-        }
-    }
-
-    retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
-    FGR_RRAM_GET(retained_ram);
-
-    int32_t step_current = retained_ram.step_current;
-    if (retained_ram.step_current == STEP_UNKNOWN) {
-        retained_ram.step_current = 0;
-    } else {
-        if (driven && (motor->pwm > 0)) {
-            retained_ram.step_current++;
-        } else {
-            retained_ram.step_current--;
-        }
-    }
-
-    FGR_RRAM_SET(retained_ram);
-
-    ESP_LOGI(TAG, "motor_cb() going %s, step was %d, step has become %d, interval %lld us",
-             driven && (motor->pwm > 0) ? "up" : "down", step_current,
-             retained_ram.step_current, sensor_interval_time_us);
-
-}
-#endif
 
 /* ----------------------------------------------------------------
  * STATIC FUNCTIONS: LAUNCHER (ACTUALLY DOING STUFF)
@@ -1409,13 +1343,29 @@ static void auto_cb(void *handle, void *arg)
     }
 }
 
-// Print out the current step and height.
-static void print_step(int32_t step_current, int32_t step_ground_level)
+// Print out the current height.
+static void print_height(int32_t height_mm)
 {
-    char buffer[32];
-    snprintf(buffer, sizeof(buffer), " (%d mm)", (int) (step_current - step_ground_level) * QRD1114_STEP_LENGTH_MM);
-    ESP_LOGI(TAG, "step %d%s.", step_current,
-                step_ground_level != STEP_UNKNOWN ? buffer : "");
+    char buffer[32] = "unknown";
+    if (height_mm != POSITION_UNKNOWN) {
+        snprintf(buffer, sizeof(buffer), "%d mm", (int) height_mm);
+    }
+    ESP_LOGI(TAG, "height %s.", buffer);
+}
+
+// Print out the current height based on the current position and the ground level.
+static void print_height_from_position(int32_t position_mm, int32_t ground_level_mm)
+{
+    char buffer_position[32] = "unknown";
+    char buffer_ground_level[32] = "unknown";
+
+    if (position_mm != POSITION_UNKNOWN) {
+        snprintf(buffer_position, sizeof(buffer_position), "%d mm", (int) position_mm);
+        if (ground_level_mm != POSITION_UNKNOWN) {
+            snprintf(buffer_ground_level, sizeof(buffer_ground_level), "%d mm", (int) (position_mm - ground_level_mm));
+        }
+    }
+    ESP_LOGI(TAG, "position %s, height %s.", buffer_position, buffer_ground_level);
 }
 
 // Set the LED breathe colour according to its new state
@@ -1430,47 +1380,51 @@ static void set_led_breathe_colour(launcher_state_t state, bool emergency_stoppe
     }
 }
 
-// Modify a step count with limits
-static int32_t step_modify_and_limit(int32_t step_current, int32_t step_change,
-                                     int32_t step_max)
+// Modify a height with limits
+static int32_t height_modify_and_limit(int32_t height_mm,
+                                       int32_t height_change_mm,
+                                       int32_t height_max_mm)
 {
-    int32_t step_target = step_current + step_change;
-    if (step_target > step_max) {
-        step_target = step_max;
+    int32_t height_target_mm = height_mm + height_change_mm;
+
+    if (height_target_mm > height_max_mm) {
+        height_target_mm = height_max_mm;
     }
-    if (step_target < 0) {
-        step_target = 0;
+    if (height_target_mm < 0) {
+        height_target_mm = 0;
     }
 
-    return step_target;
+    return height_target_mm;
 }
 
 // Advance state based on commanded state LAUNCHER_STATE_MOVE_UP.
 static launcher_state_t advance_state_commanded_move_up(launcher_t *launcher,
-                                                        int32_t step_current,
-                                                        int32_t step_max,
-                                                        int32_t step_ground_level)
+                                                        int32_t height_mm,
+                                                        int32_t height_max_mm)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
-    if (step_current == STEP_UNKNOWN) {
-        // Got to have some sort of reference
-        step_current = 0;
-    }
-    if ((step_max == STEP_UNKNOWN) || (step_current < step_max)) {
+    if ((height_mm == POSITION_UNKNOWN) || (height_max_mm == POSITION_UNKNOWN) ||
+        (height_mm < height_max_mm)) {
         // Set a timeout for our move
         timer_start_us(&launcher->timer_a, MOVE_UP_DOWN_DURATION_MAX_MS * 1000);
         launcher->direction_up_not_down = true;
-        launcher->step_target = STEP_UNKNOWN;
-        ESP_LOGI(TAG, "step_current %d, timeout %d ms.", step_current, MOVE_UP_DOWN_DURATION_MAX_MS);
+        launcher->height_target_mm = POSITION_UNKNOWN;
+
+        char buffer[32] = "unknown";
+        if (height_mm != POSITION_UNKNOWN) {
+            snprintf(buffer, sizeof(buffer), "%d mm", (int) height_mm);
+        }
+        ESP_LOGI(TAG, "height_mm %s, timeout %d ms.", buffer, MOVE_UP_DOWN_DURATION_MAX_MS);
+
         // Move up
-        motor_start(&launcher->motor, launcher->direction_up_not_down,
-                    nvs_shadow->speed_mm_per_second, MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT);
+        motor_set_speed(&launcher->motor, launcher->direction_up_not_down,
+                        nvs_shadow->speed_mm_per_second, MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT);
         next_state = LAUNCHER_STATE_MOVE_UP;
     } else {
         ESP_LOGW(TAG, "ignoring move up, already at limit (step %d (%d mm)).",
-                 step_current, (step_current - step_ground_level) * QRD1114_STEP_LENGTH_MM);
+                 height_mm, height_max_mm);
     }
 
     return next_state;
@@ -1478,24 +1432,25 @@ static launcher_state_t advance_state_commanded_move_up(launcher_t *launcher,
 
 // Advance state based on commanded state LAUNCHER_STATE_MOVE_DOWN.
 static launcher_state_t advance_state_commanded_move_down(launcher_t *launcher,
-                                                          int32_t step_current,
-                                                          int32_t step_ground_level)
+                                                          int32_t height_mm)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
-    if (step_current == STEP_UNKNOWN) {
-        // Got to have some sort of reference
-        step_current = 0;
-    }
     // Note: stepping down should work irrespective of ground level as this might
     // be an operation to reset where the ground level is
     timer_start_us(&launcher->timer_a, MOVE_UP_DOWN_DURATION_MAX_MS * 1000);
     launcher->direction_up_not_down = false;
-    launcher->step_target = STEP_UNKNOWN;
-    ESP_LOGI(TAG, "step_current %d, timeout %d ms.", step_current, MOVE_UP_DOWN_DURATION_MAX_MS);
-    motor_start(&launcher->motor, launcher->direction_up_not_down,
-                nvs_shadow->speed_mm_per_second, MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT);
+    launcher->height_target_mm = POSITION_UNKNOWN;
+
+    char buffer[32] = "unknown";
+    if (height_mm != POSITION_UNKNOWN) {
+        snprintf(buffer, sizeof(buffer), "%d mm", (int) height_mm);
+    }
+    ESP_LOGI(TAG, "height_mm %s, timeout %d ms.", buffer, MOVE_UP_DOWN_DURATION_MAX_MS);
+
+    motor_set_speed(&launcher->motor, launcher->direction_up_not_down,
+                    nvs_shadow->speed_mm_per_second, MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT);
     next_state = LAUNCHER_STATE_MOVE_DOWN;
 
     return next_state;
@@ -1503,15 +1458,14 @@ static launcher_state_t advance_state_commanded_move_down(launcher_t *launcher,
 
 // Advance state based on commanded state LAUNCHER_STATE_RUN.
 static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
-                                                    int32_t step_current,
-                                                    int32_t step_max,
-                                                    int32_t step_ground_level)
+                                                    int32_t height_mm,
+                                                    int32_t height_max_mm)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
 
-    if (step_current < step_max) {
+    if (height_mm < height_max_mm) {
         // Set up the skittering audio for a duration
         uint32_t track_number = nvs_shadow->track_number_skittering;
         int64_t duration_us = 0;
@@ -1527,8 +1481,8 @@ static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
         ESP_LOGI(TAG, "playing skittering noise for %d second(s).", duration_us / 1000000);
         next_state = LAUNCHER_STATE_RUNNING_SKITTERING;
     } else {
-        ESP_LOGW(TAG, "ignoring run, already at limit (step %d (%d mm)).",
-                 step_current, (step_ground_level - step_current) * QRD1114_STEP_LENGTH_MM);
+        ESP_LOGW(TAG, "ignoring run, already at limit (height %d (max %d mm)).",
+                 height_mm, height_max_mm);
     }
 
     return next_state;
@@ -1536,9 +1490,9 @@ static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
 
 // Advance state based on state LAUNCHER_STATE_RUNNING_SKITTERING.
 static launcher_state_t advance_state_running_skittering(launcher_t *launcher,
-                                                         int32_t step_current,
-                                                         int32_t step_max,
-                                                         int32_t step_ground_level)
+                                                         int32_t height_mm,
+                                                         int32_t height_max_mm,
+                                                         int32_t ground_level_mm)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
@@ -1554,11 +1508,13 @@ static launcher_state_t advance_state_running_skittering(launcher_t *launcher,
             audio_play_track(nvs_shadow->track_number_jumping);
         }
         // Start waking
-        launcher->step_target = step_modify_and_limit(step_current, 1, step_max);
-        ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current,
-                    launcher->step_target);
-        motor_start(&launcher->motor, launcher->direction_up_not_down,
-                    nvs_shadow->speed_mm_per_second, 100);
+        launcher->height_target_mm = height_modify_and_limit(height_mm,
+                                                             WAKING_JIGGLE_HEIGHT_MM,
+                                                             height_max_mm);
+        ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm,
+                 launcher->height_target_mm);
+        motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
+                            nvs_shadow->speed_mm_per_second, ground_level_mm);
         next_state = LAUNCHER_STATE_RUNNING_WAKING;
     }
 
@@ -1567,9 +1523,9 @@ static launcher_state_t advance_state_running_skittering(launcher_t *launcher,
 
 // Advance state based on state LAUNCHER_STATE_WAKING.
 static launcher_state_t advance_state_running_waking(launcher_t *launcher,
-                                                     int32_t step_current,
-                                                     int32_t step_max,
-                                                     int32_t step_ground_level)
+                                                     int32_t height_mm,
+                                                     int32_t height_max_mm,
+                                                     int32_t ground_level_mm)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
@@ -1581,26 +1537,29 @@ static launcher_state_t advance_state_running_waking(launcher_t *launcher,
         timer_start_us(&launcher->timer_b, RANDOM_PAUSE_TIME_MS * 1000);
         launcher->temporary_stop = false;
         // Start jumping
-        launcher->step_target = step_max;
+        launcher->height_target_mm = height_max_mm;
         launcher->direction_up_not_down = true;
-        ESP_LOGI(TAG, "step_current %d, step_target %d%s.", step_current, launcher->step_target,
+        ESP_LOGI(TAG, "height_mm %d, height_target_mm %d%s.", height_mm, launcher->height_target_mm,
                  nvs_shadow->random_enabled ? " (random is enabled)" : "");
-        motor_start(&launcher->motor, launcher->direction_up_not_down,
-                    nvs_shadow->speed_mm_per_second, 100);
+        motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
+                            nvs_shadow->speed_mm_per_second, ground_level_mm);
         next_state = LAUNCHER_STATE_RUNNING_JUMPING;
     } else {
         // Continue waking up the spider
         if (launcher->temporary_stop) {
             if (timer_has_expired(&launcher->timer_b)) {
                 launcher->temporary_stop = false;
-                launcher->step_target = step_modify_and_limit(step_current, 1, step_max);
-                ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current,
-                         launcher->step_target);
-                motor_start(&launcher->motor, launcher->direction_up_not_down,
-                            nvs_shadow->speed_mm_per_second, 100);
+                launcher->height_target_mm = height_modify_and_limit(height_mm,
+                                                                     WAKING_JIGGLE_HEIGHT_MM,
+                                                                     height_max_mm);
+                ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm,
+                         launcher->height_target_mm);
+                motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
+                                    nvs_shadow->speed_mm_per_second, ground_level_mm);
+
             }
         } else {
-            if (step_current >= launcher->step_target) {
+            if (height_mm >= launcher->height_target_mm) {
                 timer_start_us(&launcher->timer_b, WAKING_STOP_MS * 1000);
                 launcher->temporary_stop = true;
                 ESP_LOGI(TAG, "stopping for %d ms.", WAKING_STOP_MS);
@@ -1614,14 +1573,14 @@ static launcher_state_t advance_state_running_waking(launcher_t *launcher,
 
 // Advance state based on state LAUNCHER_STATE_RUNNING_JUMPING.
 static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
-                                                      int32_t step_current,
-                                                      int32_t step_max,
-                                                      int32_t step_ground_level)
+                                                      int32_t height_mm,
+                                                      int32_t height_max_mm,
+                                                      int32_t ground_level_mm)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
-    if (step_current < launcher->step_target) {
+    if (height_mm < launcher->height_target_mm) {
         if (nvs_shadow->random_enabled) {
             // Stop randomly to make the rise jerky
             if (!launcher->temporary_stop && timer_has_expired(&launcher->timer_b)) {
@@ -1632,24 +1591,24 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
                     launcher->temporary_stop = true;
                 } else {
                     ESP_LOGI(TAG, "won't stop randomly for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
-                    ESP_LOGI(TAG, "step_current %d, step_target %d%.", step_current, launcher->step_target);
+                    ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm, launcher->height_target_mm);
                     timer_start_us(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
                 }
             }
             if (launcher->temporary_stop && timer_has_expired(&launcher->timer_a)) {
                 ESP_LOGI(TAG, "restarting after random stop, won't stop again for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
-                ESP_LOGI(TAG, "step_current %d, step_target %d%.", step_current, launcher->step_target);
-                motor_start(&launcher->motor, launcher->direction_up_not_down,
-                            nvs_shadow->speed_mm_per_second, 100);
+                ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm, launcher->height_target_mm);
+                motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
+                                    nvs_shadow->speed_mm_per_second, ground_level_mm);
                 timer_start_us(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
                 launcher->temporary_stop = false;
             }
         }
     } else {
         // Done.
-        launcher->step_target = STEP_UNKNOWN;
+        launcher->height_target_mm = POSITION_UNKNOWN;
         motor_stop(&launcher->motor, true);
-        print_step(step_current, step_ground_level);
+        print_height(height_mm);
         timer_start_us(&launcher->timer_a, DANGLE_TIME_SECONDS * 1000000);
         // Start audio
         if (!nvs_shadow->mute) {
@@ -1664,9 +1623,8 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
 
 // Advance state based on state LAUNCHER_STATE_RUNNING_DANGLING.
 static launcher_state_t advance_state_running_dangling(launcher_t *launcher,
-                                                       int32_t step_current,
-                                                       int32_t step_max,
-                                                       int32_t step_ground_level)
+                                                       int32_t height_mm,
+                                                       int32_t ground_level_mm)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
@@ -1679,11 +1637,12 @@ static launcher_state_t advance_state_running_dangling(launcher_t *launcher,
         if (!nvs_shadow->mute) {
             audio_play_track(nvs_shadow->track_number_resetting);
         }
-        launcher->step_target = step_ground_level;
+        launcher->height_target_mm = 0;
         launcher->direction_up_not_down = false;
-        ESP_LOGI(TAG, "step_current %d, step_target %d.", step_current, launcher->step_target);
-        motor_start(&launcher->motor, launcher->direction_up_not_down,
-                    nvs_shadow->speed_mm_per_second, RESETTING_SPEED_MODIFIER_PERCENT);
+        ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm, launcher->height_target_mm);
+        motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
+                            nvs_shadow->speed_mm_per_second * RESETTING_SPEED_MODIFIER_PERCENT / 100,
+                            ground_level_mm);
         next_state = LAUNCHER_STATE_RUNNING_RESETTING;
     }
 
@@ -1692,18 +1651,16 @@ static launcher_state_t advance_state_running_dangling(launcher_t *launcher,
 
 // Advance state based on state LAUNCHER_STATE_RUNNING_RESETTING.
 static launcher_state_t advance_state_running_resetting(launcher_t *launcher,
-                                                        int32_t step_current,
-                                                        int32_t step_max,
-                                                        int32_t step_ground_level)
+                                                        int32_t height_mm)
 {
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
 
-    if ((step_current != STEP_UNKNOWN) && (step_current <= launcher->step_target)) {
+    if ((height_mm != POSITION_UNKNOWN) && (height_mm <= launcher->height_target_mm)) {
         // Done.
-        launcher->step_target = STEP_UNKNOWN;
+        launcher->height_target_mm = POSITION_UNKNOWN;
         motor_stop(&launcher->motor, true);
-        print_step(step_current, step_ground_level);
-        next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
+        print_height(height_mm);
+        next_state = LAUNCHER_STATE_POSITION_UNKNOWN;
     }
 
     return next_state;
@@ -1717,20 +1674,20 @@ static launcher_state_t advance_state_running_resetting(launcher_t *launcher,
 static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t commanded_state,
                                       retained_ram_t *retained_ram)
 {
+    launcher_motor_t *motor = &launcher->motor;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     // Use a signed value here so that negative indicates not known
-    int32_t step_current = STEP_UNKNOWN;
-    int32_t step_ground_level = STEP_UNKNOWN;
-    if (retained_ram) {
-        step_current = (int32_t) retained_ram->step_current;
-        step_ground_level = (int32_t) retained_ram->step_ground_level;
+    int32_t position_mm = motor_get_position_mm(motor);
+    int32_t height_mm = POSITION_UNKNOWN;
+    int32_t ground_level_mm = POSITION_UNKNOWN;
+    if (retained_ram && (position_mm != POSITION_UNKNOWN)) {
+        ground_level_mm = (int32_t) retained_ram->ground_level_mm;
+        if (ground_level_mm != POSITION_UNKNOWN) {
+            height_mm = position_mm - ground_level_mm;
+        }
     }
-    int32_t step_max = STEP_UNKNOWN;
-    if (step_ground_level != STEP_UNKNOWN) {
-        uint32_t height_max_mm = nvs_shadow->height_max_mm;
-        step_max = step_ground_level + ((int32_t) height_max_mm / QRD1114_STEP_LENGTH_MM);
-    }
+    int32_t height_max_mm = nvs_shadow->height_max_mm;
 
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     if (commanded_state == LAUNCHER_STATE_HALT) {
@@ -1741,26 +1698,23 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
         // Handle the current state
         switch(launcher->state) {
             case LAUNCHER_STATE_NULL:
-                next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
+                next_state = LAUNCHER_STATE_POSITION_UNKNOWN;
             break;
-            case LAUNCHER_STATE_HEIGHT_UNKNOWN:
+            case LAUNCHER_STATE_POSITION_UNKNOWN:
                 // If we know where the ground is we can transition
                 // to ready state
-                if (step_ground_level != STEP_UNKNOWN) {
+                if ((ground_level_mm != POSITION_UNKNOWN) && (height_mm != POSITION_UNKNOWN)) {
                     next_state = LAUNCHER_STATE_READY;
                 } else {
                     // From height unknown state we can only do steps
                     switch (commanded_state) {
                         case LAUNCHER_STATE_MOVE_UP:
                             next_state = advance_state_commanded_move_up(launcher,
-                                                                         step_current,
-                                                                         STEP_UNKNOWN,
-                                                                         step_ground_level);
+                                                                         height_mm,
+                                                                         height_max_mm);
                         break;
                         case LAUNCHER_STATE_MOVE_DOWN:
-                            next_state = advance_state_commanded_move_down(launcher,
-                                                                           step_current,
-                                                                           step_ground_level);
+                            next_state = advance_state_commanded_move_down(launcher, height_mm);
                         break;
                         case LAUNCHER_STATE_NULL:
                             // Nothing to do
@@ -1777,14 +1731,11 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                 switch (commanded_state) {
                     case LAUNCHER_STATE_MOVE_UP:
                         next_state = advance_state_commanded_move_up(launcher,
-                                                                     step_current,
-                                                                     step_max,
-                                                                     step_ground_level);
+                                                                     height_mm,
+                                                                     height_max_mm);
                     break;
                     case LAUNCHER_STATE_MOVE_DOWN:
-                        next_state = advance_state_commanded_move_down(launcher,
-                                                                       step_current,
-                                                                       step_ground_level);
+                        next_state = advance_state_commanded_move_down(launcher, height_mm);
                     break;
                     case LAUNCHER_STATE_RUN:
                         // Run away
@@ -1805,12 +1756,13 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                     timer_start_us(&launcher->timer_a, MOVE_UP_DOWN_DURATION_MAX_MS * 1000);
                 }
                 if (timer_has_expired(&launcher->timer_a) ||
-                    ((step_max != STEP_UNKNOWN) && (step_current >= step_max))) {
+                    ((height_mm != POSITION_UNKNOWN) && (height_max_mm != POSITION_UNKNOWN) &&
+                    (height_mm >= height_max_mm))) {
                     // Done.
-                    launcher->step_target = STEP_UNKNOWN;
+                    launcher->height_target_mm = POSITION_UNKNOWN;
                     motor_stop(&launcher->motor, true);
-                    print_step(step_current, step_ground_level);
-                    next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
+                    print_height_from_position(position_mm, ground_level_mm);
+                    next_state = LAUNCHER_STATE_POSITION_UNKNOWN;
                 }
             break;
             case LAUNCHER_STATE_MOVE_DOWN:
@@ -1822,50 +1774,45 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                     // Done.
                     // Note: stepping down should work irrespective of ground level as this might
                     // be an operation to reset where the ground level is
-                    launcher->step_target = STEP_UNKNOWN;
+                    launcher->height_target_mm = POSITION_UNKNOWN;
                     motor_stop(&launcher->motor, true);
-                    print_step(step_current, step_ground_level);
-                    next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
+                    print_height_from_position(position_mm, ground_level_mm);
+                    next_state = LAUNCHER_STATE_POSITION_UNKNOWN;
                 }
             break;
             case LAUNCHER_STATE_RUN:
                 next_state = advance_state_commanded_run(launcher,
-                                                         step_current,
-                                                         step_max,
-                                                         step_ground_level);
+                                                         height_mm,
+                                                         height_max_mm);
             break;
             case LAUNCHER_STATE_RUNNING_SKITTERING:
                 next_state = advance_state_running_skittering(launcher,
-                                                              step_current,
-                                                              step_max,
-                                                              step_ground_level);
+                                                              height_mm,
+                                                              height_max_mm,
+                                                              ground_level_mm);
             break;
             case LAUNCHER_STATE_RUNNING_WAKING:
                 next_state = advance_state_running_waking(launcher,
-                                                          step_current,
-                                                          step_max,
-                                                          step_ground_level);
+                                                          height_mm,
+                                                          height_max_mm,
+                                                          ground_level_mm);
             break;
             case LAUNCHER_STATE_RUNNING_JUMPING:
                 next_state = advance_state_running_jumping(launcher,
-                                                           step_current,
-                                                           step_max,
-                                                           step_ground_level);
+                                                           height_mm,
+                                                           height_max_mm,
+                                                           ground_level_mm);
             break;
             case LAUNCHER_STATE_RUNNING_DANGLING:
                 next_state = advance_state_running_dangling(launcher,
-                                                            step_current,
-                                                            step_max,
-                                                            step_ground_level);
+                                                            height_mm,
+                                                            ground_level_mm);
             break;
             case LAUNCHER_STATE_RUNNING_RESETTING:
-                next_state = advance_state_running_resetting(launcher,
-                                                             step_current,
-                                                             step_max,
-                                                             step_ground_level);
+                next_state = advance_state_running_resetting(launcher, height_mm);
             break;
             case LAUNCHER_STATE_HALT:
-                next_state = LAUNCHER_STATE_HEIGHT_UNKNOWN;
+                next_state = LAUNCHER_STATE_POSITION_UNKNOWN;
             break;
             default:
                 ESP_LOGE(TAG, "current state is unknown (%d)!", launcher->state);
@@ -1906,7 +1853,7 @@ static void launcher_cb(void *handle, void *arg)
             // Check if the commanded state is allowed
             switch (commanded_state) {
                 case LAUNCHER_STATE_NULL:
-                case LAUNCHER_STATE_HEIGHT_UNKNOWN:
+                case LAUNCHER_STATE_POSITION_UNKNOWN:
                 case LAUNCHER_STATE_READY:
                 case LAUNCHER_STATE_RUNNING_SKITTERING:
                 case LAUNCHER_STATE_RUNNING_WAKING:
@@ -1922,7 +1869,7 @@ static void launcher_cb(void *handle, void *arg)
                 case LAUNCHER_STATE_MOVE_DOWN:
                     // Can do these if we don't know our height or are ready
                     if ((launcher->state == LAUNCHER_STATE_READY) ||
-                        (launcher->state == LAUNCHER_STATE_HEIGHT_UNKNOWN)) {
+                        (launcher->state == LAUNCHER_STATE_POSITION_UNKNOWN)) {
                         ESP_LOGI(TAG, "got %s.", name);
                     } else {
                         // Can also do these again if we were already doing them
@@ -1931,7 +1878,7 @@ static void launcher_cb(void *handle, void *arg)
                         } else {
                             ESP_LOGW(TAG, "cannot get to state %s from state %s (only from states %s and %s).",
                                      name, g_launcher_state_name[launcher->state],
-                                     g_launcher_state_name[LAUNCHER_STATE_HEIGHT_UNKNOWN],
+                                     g_launcher_state_name[LAUNCHER_STATE_POSITION_UNKNOWN],
                                      g_launcher_state_name[LAUNCHER_STATE_READY]);
                             commanded_state = LAUNCHER_STATE_NULL;
                             fgr_debug_led_flash(FGR_DEBUG_LED_SHORT_MS, FGR_DEBUG_LED_COLOUR_BAD);
@@ -2036,17 +1983,29 @@ static void handler_down(launcher_t *launcher, uint32_t enable, bool read_not_wr
 // Handle the "this is ground level" command.
 static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
+    launcher_motor_t *motor = &launcher->motor;
+
     (void) unused;
     (void) read_not_write;
 
-    // Set the groud level step to the current step
+    // Set the groud level step to the current position of the TMC5160
     retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
     if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
-        if (retained_ram.step_current != STEP_UNKNOWN) {
-            retained_ram.step_ground_level = retained_ram.step_current;
-            FGR_RRAM_SET(retained_ram);
+        // We are now establishing height according to the
+        // TMC5160 so acknowledge the reset flag over there, just
+        // in case
+        int32_t err = tmc5160_acknowledge_reset(motor->handle);
+        if (err == ESP_OK) {
+            int32_t microsteps;
+            err = tmc5160_get_position(motor->handle, &microsteps);
+            if (err == ESP_OK) {
+                retained_ram.ground_level_mm = microsteps_to_mm(microsteps);
+                FGR_RRAM_SET(retained_ram);
+            } else {
+                ESP_LOGW(TAG, "failed to get position from TMC5160, cannot set ground level.");
+            }
         } else {
-            ESP_LOGW(TAG, "cannot set ground level as current step is unknown.");
+            ESP_LOGW(TAG, "unable to acknowledge reset in TMC5160, cannot set ground level.");
         }
     }
 }
@@ -2054,19 +2013,33 @@ static void handler_this_is_ground_level(launcher_t *launcher, uint32_t unused, 
 // Handle the "this is height max" command.
 static void handler_this_is_height_max(launcher_t *launcher, uint32_t unused, bool read_not_write)
 {
+    launcher_motor_t *motor = &launcher->motor;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     (void) unused;
     (void) read_not_write;
 
-    // Get the current height
+    // Get the current position from the TMC5160
     retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
     if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
-        (retained_ram.step_ground_level != STEP_UNKNOWN) &&
-        (retained_ram.step_current != STEP_UNKNOWN)) {
-        // Set the "height max" value in NVS
-        nvs_height_max_mm_set(nvs_shadow,
-                              (retained_ram.step_current - retained_ram.step_ground_level) * QRD1114_STEP_LENGTH_MM);
+        (retained_ram.ground_level_mm != POSITION_UNKNOWN)) {
+        int32_t microsteps;
+        int32_t err = tmc5160_get_position(motor->handle, &microsteps);
+        if ((err == ESP_OK) && !tmc5160_has_reset(motor->handle)) {
+            // Convert to a height in mm
+            int32_t height_mm = microsteps_to_mm(microsteps);
+            if ((height_mm < POSITION_UNKNOWN) && (height_mm > retained_ram.ground_level_mm)) {
+                // Set the "height max" value in NVS
+                nvs_height_max_mm_set(nvs_shadow,
+                                    (height_mm - retained_ram.ground_level_mm));
+            } else {
+                ESP_LOGW(TAG, "not setting height max, height returned by TMC5160()"
+                         " (%d mm, %d microsteps, with ground at %d mm) out of range.",
+                         height_mm, microsteps, retained_ram.ground_level_mm);
+            }
+        } else {
+            ESP_LOGW(TAG, "failed to get position from TMC5160, cannot set height.");
+        }
     }
 }
 
@@ -2098,8 +2071,7 @@ static void handler_reset_to_defaults(launcher_t *launcher, uint32_t unused, boo
     // but leave emergency stopped alone
     retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
     if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
-        retained_ram.step_current = 0;
-        retained_ram.step_ground_level = STEP_UNKNOWN;
+        retained_ram.ground_level_mm = POSITION_UNKNOWN;
         FGR_RRAM_SET(retained_ram);
     }
 
@@ -2256,7 +2228,7 @@ static bool can_reset_height_parameters(launcher_state_t launcher_state)
     bool can_reset = false;
 
     if ((launcher_state == LAUNCHER_STATE_NULL) ||
-        (launcher_state == LAUNCHER_STATE_HEIGHT_UNKNOWN) ||
+        (launcher_state == LAUNCHER_STATE_POSITION_UNKNOWN) ||
         (launcher_state == LAUNCHER_STATE_READY)) {
         can_reset = true;
     }
@@ -2590,6 +2562,9 @@ static int characteristic_speed_mm_per_second_cb(uint16_t conn_handle, uint16_t 
         if (command_contents.value < SPEED_MIN_MM_PER_SECOND) {
             command_contents.value = SPEED_MIN_MM_PER_SECOND;
         }
+        if (command_contents.value > SPEED_MAX_MM_PER_SECOND) {
+            command_contents.value = SPEED_MAX_MM_PER_SECOND;
+        }
     }
     return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
 
@@ -2787,20 +2762,28 @@ static int characteristic_height_current_mm_cb(uint16_t conn_handle, uint16_t at
 {
     int return_code = BLE_ATT_ERR_UNLIKELY;
     context_t *context = (context_t *) arg;
+    launcher_t *launcher = &context->launcher;
+    launcher_motor_t *motor = &launcher->motor;
 
     CONTEXT_LOCK(context->lock, "characteristic_height_current_mm_cb");
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         command_contents_t command_contents = {.command = COMMAND_HEIGHT_CURRENT_MM,
                                                .value = (uint32_t) -1};
-        retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
-        if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
-            (retained_ram.step_ground_level != STEP_UNKNOWN) &&
-            (retained_ram.step_current != STEP_UNKNOWN)) {
-            // Populate the current height if we have it
-            command_contents.value = (retained_ram.step_current - retained_ram.step_ground_level) * QRD1114_STEP_LENGTH_MM;
+        // Read the current position from the TMC5160
+        int32_t microsteps;
+        int32_t err = tmc5160_get_position(motor->handle, &microsteps);
+        if ((err == ESP_OK) && !tmc5160_has_reset(motor->handle)) {
+            // Convert to a height in mm
+            int32_t height_mm = microsteps_to_mm(microsteps);
+            retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
+            if ((FGR_RRAM_GET(retained_ram) == ESP_OK) &&
+                (retained_ram.ground_level_mm!= POSITION_UNKNOWN)) {
+                // Populate the current height if we know where the ground is
+                command_contents.value = height_mm - retained_ram.ground_level_mm;
+            }
+            return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
         }
-        return_code = queue_command(conn_handle, attr_handle, ctxt, context, &command_contents);
     }
 
     CONTEXT_UNLOCK(context->lock, "characteristic_height_current_mm_cb");
@@ -3203,6 +3186,7 @@ static void command_cb(void *handle, void *arg)
 static int32_t init(context_t *context)
 {
     launcher_t *launcher = &context->launcher;
+    launcher_motor_t *motor = &launcher->motor;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
     // Allow us to feed the watchdog
@@ -3219,37 +3203,13 @@ static int32_t init(context_t *context)
 
         CONTEXT_LOCK(context->lock, "init");
 
-        retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
-        if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
-            if ((retained_ram.step_current != STEP_UNKNOWN) &&
-                (retained_ram.step_ground_level != STEP_UNKNOWN)) {
-                // There is retained RAM, which means we
-                // were running, so set the initial
-                // state to resetting
-                int32_t height_steps = retained_ram.step_current - retained_ram.step_ground_level;
-                ESP_LOGI(TAG, "warm start (current height is %d mm (%d step(s)), %s).",
-                        height_steps * QRD1114_STEP_LENGTH_MM, height_steps,
-                        retained_ram.emergency_stopped ? "EMERGENCY STOPPED" : "not emergency stopped");
-                launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
-            }
-        } else {
-            // Set ground level to definitively unknown and make the
-            // current 0 and not emergency_stopped
-            retained_ram.step_current = 0;
-            retained_ram.step_ground_level = STEP_UNKNOWN;
-            retained_ram.emergency_stopped = false;
-            FGR_RRAM_SET(retained_ram);
-        }
-
         // Initialise tasking, FGR style
         if (err == ESP_OK) {
             err = fgr_task_init();
         }
 
-#if 1
         // Initialise the TMC5160 stepper motor controller
         if (err == ESP_OK) {
-            launcher_motor_t *motor = &launcher->motor;
             err = tmc5160_init(CONFIG_TMC5160_SPI_NUM, CONFIG_TMC5160_SPI_SCK_PIN,
                                CONFIG_TMC5160_SPI_MOSI_PIN, CONFIG_TMC5160_SPI_MISO_PIN,
                                CONFIG_TMC5160_SPI_CS_PIN, CONFIG_TMC5160_SPI_CLOCK_HZ);
@@ -3280,6 +3240,7 @@ static int32_t init(context_t *context)
                         ESP_LOGE(TAG, "unable to configure chopper (%s)!", esp_err_to_name(-err));
                     }
                     if (err == ESP_OK) {
+                        // Engage stealth mods
                         err = tmc5160_set_chopper_mode(motor->handle, TMC5160_CHOPPER_STEALTH_CHOP);
                         if (err == ESP_OK) {
                             ESP_LOGI(TAG, "chopper mode set to TMC5160_CHOPPER_STEALTH_CHOP.");
@@ -3303,6 +3264,7 @@ static int32_t init(context_t *context)
                         }
                     }
                     if (err == ESP_OK) {
+                        // Finally enable the motor
                         err = tmc5160_motor_enable(motor->handle);
                         if (err == ESP_OK) {
                             ESP_LOGI(TAG, "motor is enabled.");
@@ -3337,23 +3299,75 @@ static int32_t init(context_t *context)
 
             }
         }
-#else
-        // Initialise a brushless motor
-        if (err == ESP_OK) {
-            err = motor_init();
-            if (err == ESP_OK) {
-                err = -ESP_ERR_NO_MEM;
-                launcher_motor_t *motor = &launcher->motor;
-                motor->handle = motor_create(CONFIG_SPIDER_LAUNCHER_MOTOR_PWM_PIN,
-                                             CONFIG_SPIDER_LAUNCHER_MOTOR_DIRECTION_PIN,
-                                             CONFIG_SPIDER_LAUNCHER_QRD1114_PIN,
-                                             motor_cb, motor);
-                if (motor->handle) {
-                    err = ESP_OK;
+
+        // Sort retained RAM if we can, irrespective of error state.
+        retained_ram_t retained_ram = DEFAULTS_RETAINED_RAM;
+        if (FGR_RRAM_GET(retained_ram) != ESP_OK) {
+            // Retained RAM unavailable: ground is unknown.
+            retained_ram.ground_level_mm = POSITION_UNKNOWN;
+            retained_ram.emergency_stopped = false;
+            FGR_RRAM_SET(retained_ram);
+        }
+
+        if (motor->handle && (err == ESP_OK)) {
+            bool reset_detected = tmc5160_has_reset(motor->handle);
+
+            if (reset_detected) {
+                // The TMC5160 has reset (or its status could not be read).
+                // Its position can no longer be trusted.
+                ESP_LOGW(TAG, "TMC5160 reset detected; invalidating ground level.");
+
+                retained_ram.ground_level_mm = POSITION_UNKNOWN;
+            }
+
+            // Persist any invalidation before acknowledging the reset.
+            // If this fails, leave the reset indication uncleared.
+            if (!reset_detected ||
+                (FGR_RRAM_SET(retained_ram) == ESP_OK)) {
+
+                int32_t ack_err = tmc5160_acknowledge_reset(motor->handle);
+
+                if (ack_err != ESP_OK) {
+                    ESP_LOGE(TAG, "Unable to acknowledge TMC5160 reset (%s).",
+                             esp_err_to_name(-ack_err));
                 }
+
+                // Attempt warm-start recovery only if the TMC5160 has
+                // not reset and we have a known ground reference.
+                if (!reset_detected &&
+                    (ack_err == ESP_OK) &&
+                    (retained_ram.ground_level_mm != POSITION_UNKNOWN)) {
+
+                    int32_t microsteps = 0;
+
+                    if (tmc5160_get_position(motor->handle, &microsteps) == ESP_OK) {
+                        int32_t height_mm = microsteps_to_mm(microsteps) - retained_ram.ground_level_mm;
+
+                        ESP_LOGI(TAG, "warm start (height %d mm, %d microsteps, %s).",
+                                (int) height_mm,
+                                (int) microsteps,
+                                retained_ram.emergency_stopped ? "EMERGENCY STOPPED" : "not emergency stopped");
+
+                        if (!retained_ram.emergency_stopped) {
+                            launcher->height_target_mm = 0;
+                            launcher->direction_up_not_down = false;
+
+                            motor_set_height_mm(motor,
+                                                launcher->height_target_mm,
+                                                nvs_shadow->speed_mm_per_second *
+                                                RESETTING_SPEED_MODIFIER_PERCENT / 100,
+                                                retained_ram.ground_level_mm);
+
+                            launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
+                        }
+                    }
+                }
+            } else {
+                ESP_LOGE(TAG, "Unable to invalidate retained ground level; "
+                         "TMC5160 reset not acknowledged.");
             }
         }
-#endif
+
 #if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM) && (CONFIG_SPIDER_LAUNCHER_AUDIO_UART_NUM >= 0)
         // Initialise a UART to control the DY HV8F audio board
         if (err == ESP_OK) {
@@ -3537,14 +3551,11 @@ void app_main(void)
         if (nvs_shadow->mute) {
             ESP_LOGI(TAG, "muted, not playing any audio.");
         }
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "setting motor to run at 250 mHz.");
-            err = tmc5160_set_velocity(motor->handle, 250);
-        }
         while (err == ESP_OK) {
             // Let BLE commands do their thing
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_task_wdt_reset();
+#if 0
             uint32_t status;
             if (tmc5160_read(motor->handle, 0x6f, &status) == ESP_OK) {
                 ESP_LOGI(TAG, "DRV_STATUS 0x%08" PRIx32, status);
@@ -3555,13 +3566,15 @@ void app_main(void)
             if (tmc5160_read(motor->handle, 0x21, &status) == ESP_OK) {
                 ESP_LOGI(TAG, "XACTUAL 0x%08" PRIx32, status);
             }
+            if (tmc5160_read(motor->handle, 0x00, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "GCONF 0x%08" PRIx32, status);
+            }
+            if (tmc5160_read(motor->handle, 0x6c, &status) == ESP_OK) {
+                ESP_LOGI(TAG, "CHOPCONF 0x%08" PRIx32, status);
+            }
             int32_t millihertz;
             if (tmc5160_get_velocity(motor->handle, &millihertz) == ESP_OK) {
                 ESP_LOGI(TAG, "velocity is now %d milliHertz.", millihertz);
-            }
-#if 0
-            if (tmc5160_read(motor->handle, 0x00, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "GCONF 0x%08" PRIx32, status);
             }
             if (tmc5160_read(motor->handle, 0x70, &status) == ESP_OK) {
                 ESP_LOGI(TAG, "PWMCONF 0x%08" PRIx32, status);
@@ -3582,8 +3595,6 @@ void app_main(void)
         }
         esp_task_wdt_delete(NULL);
         ESP_LOGE(TAG, "dropped out with error (%s)!", esp_err_to_name(-err));
-        tmc5160_motor_disable(motor->handle);
-        tmc5160_set_velocity(motor->handle, 0);
     } else {
         ESP_LOGE(TAG, "initialization failed, system cannot continue, will restart soonish.");
     }
@@ -3592,19 +3603,16 @@ void app_main(void)
     nimble_port_stop();
     fgr_debug_deinit();
     fgr_ws2812_deinit();
-#if 1
     if (motor->handle) {
+        tmc5160_set_velocity(motor->handle, 0);
         tmc5160_motor_disable(motor->handle);
     }
     tmc5160_deinit();
     if (motor->queue_stall) {
         vQueueDelete(motor->queue_stall);
     }
-#  if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
+#if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
     tmc5160_deinit_stallguard(CONFIG_TMC5160_DIAG_PIN);
-#  endif
-#else
-    motor_deinit();
 #endif
     fgr_task_deinit();
     if (context->command_queue){

@@ -113,6 +113,28 @@ void tmc5160_destroy(stepper_t *stepper);
  */
 void tmc5160_deinit();
 
+/** Call this to determine if the TMC5160 has reset
+ * since tmc5160_acknowledge_reset() was last called.
+ *
+ * @param stepper the stepper instance that was returned by
+ *                tmc5160_create().
+ * @return        true if this function has reset since
+ *                tmc5160_acknowledge_reset() was last
+ *                called.
+ */
+bool tmc5160_has_reset(stepper_t *stepper);
+
+/** Acknowledge the reset bit; after this is callled
+ * tmc5160_has_reset() will return false until the TMC5160
+ * next resets.
+ *
+ * @param stepper the stepper instance that was returned by
+ *                tmc5160_create().
+ * @return        zero on success else negative error code
+ *                from esp_err_t.
+ */
+int32_t tmc5160_acknowledge_reset(stepper_t *stepper);
+
 /** Enable the motor of a TMC5160; only needs to be called if
  * a pin_motor_enable was provided to tmc5160_start().
  *
@@ -171,15 +193,6 @@ int32_t tmc5160_read(stepper_t *stepper, int32_t reg, uint32_t *data);
  *                error code from esp_err_t.
  */
 int32_t tmc5160_read_lines(stepper_t *stepper);
-
-/** Read the microstep counter of a TMC5160.
- *
- * @param stepper the stepper instance that was returned
- *                by tmc5160_create().
- * @return        the count, else negative error code
- *                from esp_err_t.
- */
- int32_t tmc5160_get_position(stepper_t *stepper);
 
 /** Set the microstep resolution of a TMC5160.
  *
@@ -263,6 +276,28 @@ int32_t tmc5160_set_velocity(stepper_t *stepper,
  *                    code from esp_err_t.
  */
 int32_t tmc5160_get_velocity(stepper_t *stepper, int32_t *millihertz);
+
+/** Command the TMC5160 to move to a position.
+ *
+ * @param stepper                  the stepper instance that was returned
+ *                                 by tmc5160_create().
+ * @param microsteps               the position to move to, in micro steps.
+ * @param max_velocity_millihertz  the maximum speed at which to move
+ * @return                         zero on success else negatie errp
+ *                                 code from esp_err_t.
+ */
+int32_t tmc5160_set_position(stepper_t *stepper, int32_t microsteps,
+                             uint32_t max_velocity_millihertz);
+
+/** Read the microstep counter of a TMC5160.
+ *
+ * @param stepper    the stepper instance that was returned
+ *                   by tmc5160_create().
+ * @param microsteps the current micro step count.
+ * @return           the count, else negative error code
+ *                   from esp_err_t.
+ */
+ int32_t tmc5160_get_position(stepper_t *stepper, int32_t *microsteps);
 
 /** Select spreadCycle or stealthChop operation.
  *
