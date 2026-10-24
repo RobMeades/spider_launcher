@@ -36,10 +36,4 @@ menu "TMC5160 Configuration"
         help
             Pin connected to the TMC5160 EN pin
 
-    config TMC5160_DIAG_PIN
-        int "DIAG pin for stepper motor control"
-        default -1
-        help
-            Pin connected to the TMC5160 DIAG pin, use -1 if there is none.
-
 endmenu

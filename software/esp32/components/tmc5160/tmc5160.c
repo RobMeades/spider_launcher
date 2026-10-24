@@ -187,7 +187,7 @@ static int32_t print_status_item(uint8_t spi_status, uint8_t mask,
         p += sprintf(p, string);
         // If any of the bits above this mask position are set,
         // add a barrier
-        if (spi_status && (-mask)) {
+        if (spi_status & (uint8_t) ~((mask << 1) - 1)) {
             p += sprintf(p, "|");
         }
     }
@@ -312,43 +312,6 @@ static int32_t read_reg(stepper_t *stepper, int32_t reg, uint32_t *data)
             if (err >= 0) {
                 err = -ESP_ERR_INVALID_RESPONSE;
             }
-        }
-    }
-
-    return err;
-}
-
-// Set the stallguard registers.
-// IMPORTANT the context should be locked before this is called.
-static int32_t set_stallguard(stepper_t *stepper, int32_t tcoolthrs,
-                              int8_t sgt)
-{
-    int32_t err = ESP_OK;
-    uint32_t data;
-
-    ESP_LOGI(TAG, "configuring StallGuard, TCOOLTHRS %d, SGT %d.",
-             tcoolthrs, sgt);
-    if (tcoolthrs < 0) {
-        // Read the TSTEP register so that we
-        // can use it as TCOOLTHRS
-        err = read_reg(stepper, 0x12, &data);
-        if (err == ESP_OK) {
-            tcoolthrs = data;
-            ESP_LOGI(TAG, "TCOOLTHRS will be TSTEP which is %d.", tcoolthrs);
-        }
-    }
-    if (err == ESP_OK) {
-        // Write to the TCOOLTHRS register (0x14)
-        err = write_reg(stepper, 0x14, tcoolthrs);
-    }
-    if (err == ESP_OK) {
-        // The SGT is in bits 16 to 22 of the COOLCNF register (0x6d)
-        err = read_reg(stepper, 0x6d, &data);
-        if (err == ESP_OK) {
-            data &= 0xff80ffff;
-            data |= ((uint32_t) sgt) << 16;
-            // Write it back again
-            err = write_reg(stepper, 0x6d, data);
         }
     }
 
@@ -1205,8 +1168,7 @@ int32_t tmc5160_set_spread_cycle_threshold(stepper_t *stepper,
 
         if (velocity_millihertz != 0) {
             uint64_t numerator = TMC5160_CLOCK_HZ * 1000ULL;
-            uint64_t denominator =
-                256ULL * MOTOR_STEPS_PER_REV * velocity_millihertz;
+            uint64_t denominator = 256ULL * MOTOR_STEPS_PER_REV * velocity_millihertz;
 
             // Round to nearest integer.
             uint64_t value = (numerator + denominator / 2) / denominator;
@@ -1314,78 +1276,6 @@ int32_t tmc5160_get_sg_result(stepper_t *stepper)
     }
 
     return err;
-}
-
-// Set the operation of stall-guard in a TMC5160.
-int32_t tmc5160_init_stallguard(stepper_t *stepper,
-                                int32_t tcoolthrs,
-                                int8_t sgt,
-                                int32_t pin,
-                                gpio_isr_t handler,
-                                void *handler_arg)
-{
-    int32_t err = -ESP_ERR_INVALID_STATE;
-
-    if (g_context.spi != NULL) {
-
-        CONTEXT_LOCK(g_context.lock, "tmc5160_init_stallguard()");
-
-        err = -ESP_ERR_INVALID_ARG;
-        if ((pin < 0) || (handler != NULL)) {
-            err = set_stallguard(stepper, tcoolthrs, sgt);
-            if ((err == ESP_OK) && (pin >= 0)) {
-                ESP_LOGI(TAG, "Configuring interrupt pin %d.", pin);
-                gpio_config_t cfg = {
-                    .intr_type = GPIO_INTR_POSEDGE,
-                    .mode = GPIO_MODE_INPUT,
-                    .pin_bit_mask = (1ULL << pin),
-                    .pull_down_en = GPIO_PULLDOWN_DISABLE,
-                    .pull_up_en = GPIO_PULLUP_ENABLE
-                };
-                err = -gpio_config(&cfg);
-                if (err == ESP_OK) {
-                    err = -gpio_install_isr_service(0);
-                    // ESP_ERR_INVALID_STATE means the ISR service was already installed
-                    if ((err == ESP_OK) || (err == ESP_ERR_INVALID_STATE)) {
-                        err = -gpio_isr_handler_add((gpio_num_t) pin,
-                                                    handler, handler_arg);
-                    }
-                }
-            }
-        }
-
-        CONTEXT_UNLOCK(g_context.lock, "tmc5160_init_stallguard()");
-
-    }
-
-    return err;
-}
-
-// Set the stall-guard registers in a TMC5160.
-int32_t tmc5160_set_stallguard(stepper_t *stepper,
-                               int32_t tcoolthrs,
-                               int8_t sgt)
-{
-    int32_t err = -ESP_ERR_INVALID_STATE;
-
-    if (g_context.spi != NULL) {
-
-        CONTEXT_LOCK(g_context.lock, "tmc5160_set_stallguard()");
-
-        err = set_stallguard(stepper, tcoolthrs, sgt);
-
-        CONTEXT_UNLOCK(g_context.lock, "tmc5160_set_stallguard()");
-
-    }
-
-    return err;
-}
-
-// Remove interrupt handling that was set up by
-// tmc5160_init_stallguard().
-void tmc5160_deinit_stallguard(int32_t pin)
-{
-    gpio_isr_handler_remove((gpio_num_t) pin);
 }
 
 // Set the CoolStep threshold registers.

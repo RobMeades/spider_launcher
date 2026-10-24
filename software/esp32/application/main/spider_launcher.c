@@ -384,8 +384,6 @@ typedef struct {
 typedef struct {
     stepper_t *handle;
     uint32_t last_current_setting_ma;
-    TaskHandle_t task_stall;
-    QueueHandle_t queue_stall;
 } launcher_motor_t;
 
 // The launcher context
@@ -1223,34 +1221,6 @@ static int32_t speed_mm_per_second_to_millihertz(int32_t speed_mm_per_second)
                       denominator);
 }
 
-#if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
-// Stall interrupt handler,
-static void motor_stall_interrupt_handler(void *arg)
-{
-    launcher_motor_t *motor = (launcher_motor_t *) arg;
-    BaseType_t higherPriorityTaskWoken = pdFALSE;
-
-    if (motor->task_stall && motor->queue_stall) {
-        uint8_t empty = 0;
-        xQueueSendFromISR(motor->queue_stall, &empty, &higherPriorityTaskWoken);
-        portYIELD_FROM_ISR(higherPriorityTaskWoken);
-    }
-}
-#endif
-
-// Callback to be run in task context to handle stall indications.
-static void motor_stall_task_cb(void *handle, void *arg)
-{
-    launcher_motor_t *motor = (launcher_motor_t *) arg;
-    uint8_t empty = 0;
-
-    (void) handle;
-
-    while (xQueueReceive(motor->queue_stall, &empty, 0) == pdTRUE) {
-        ESP_LOGI(TAG, "STALL");
-    }
-}
-
 // Set the motor current.
 static void motor_set_current_ma(launcher_motor_t *motor, uint32_t current_ma)
 {
@@ -1610,6 +1580,16 @@ static launcher_state_t advance_state_running_skittering(launcher_t *launcher,
         if (launcher->height_target_mm > height_max_mm) {
             launcher->height_target_mm = height_max_mm;
         }
+
+        // Enable sg_stop.
+        uint32_t data;
+        if (tmc5160_read(launcher->motor.handle, 0x34, &data) == ESP_OK) {
+            data |= 1UL << 10;
+            if (tmc5160_write(launcher->motor.handle, 0x34, data) == ESP_OK) {
+               ESP_LOGI(TAG, "sg_stop ENABLED");
+            }
+        }
+
         ESP_LOGI(TAG, "waking: lifting to %d mm.", launcher->height_target_mm);
         motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
                             nvs_shadow->speed_mm_per_second, ground_level_mm,
@@ -3445,28 +3425,6 @@ static int32_t init(context_t *context)
                     }
                 }
             }
-            // Create the RTOS stuff needed for stall handling
-            if (err == ESP_OK) {
-                err = -ESP_ERR_NO_MEM;
-                motor->queue_stall = xQueueCreate(10, sizeof(uint8_t));
-                if (motor->queue_stall) {
-                    err = fgr_task_create(&motor_stall_task_cb, motor, "stall_task", 4096, 3, &motor->task_stall);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "unable to create motor stall task (%s)!", esp_err_to_name(-err));
-                    }
-                } else {
-                    ESP_LOGE(TAG, "unable to create motor stall queue!");
-                }
-
-#if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
-                // Initial setup of stall detection with threshold value that means
-                // a stall should never be detected
-                if (err == ESP_OK) {
-                    //tmc5160_init_stallguard(motor->handle, -1, 63, CONFIG_TMC5160_DIAG_PIN,
-                    //                        motor_stall_interrupt_handler, motor);
-                }
-#endif
-            }
         }
 
         // Sort retained RAM if we can, irrespective of error state.
@@ -3497,7 +3455,7 @@ static int32_t init(context_t *context)
                 int32_t ack_err = tmc5160_acknowledge_reset(motor->handle);
 
                 if (ack_err != ESP_OK) {
-                    ESP_LOGE(TAG, "Unable to acknowledge TMC5160 reset (%s).",
+                    ESP_LOGE(TAG, "unable to acknowledge TMC5160 reset (%s).",
                              esp_err_to_name(-ack_err));
                 }
 
@@ -3535,7 +3493,7 @@ static int32_t init(context_t *context)
                     }
                 }
             } else {
-                ESP_LOGE(TAG, "Unable to invalidate retained ground level; "
+                ESP_LOGE(TAG, "unable to invalidate retained ground level; "
                          "TMC5160 reset not acknowledged.");
             }
         }
@@ -3731,43 +3689,6 @@ void app_main(void)
             // Let BLE commands do their thing
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_task_wdt_reset();
-#if 0
-            uint32_t status;
-            if (tmc5160_read(motor->handle, 0x6f, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "DRV_STATUS 0x%08" PRIx32, status);
-            }
-            if (tmc5160_read(motor->handle, 0x22, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "VACTUAL 0x%08" PRIx32, status);
-            }
-            if (tmc5160_read(motor->handle, 0x21, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "XACTUAL 0x%08" PRIx32, status);
-            }
-            if (tmc5160_read(motor->handle, 0x00, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "GCONF 0x%08" PRIx32, status);
-            }
-            if (tmc5160_read(motor->handle, 0x6c, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "CHOPCONF 0x%08" PRIx32, status);
-            }
-            int32_t millihertz;
-            if (tmc5160_get_velocity(motor->handle, &millihertz) == ESP_OK) {
-                ESP_LOGI(TAG, "velocity is now %d milliHertz.", millihertz);
-            }
-            if (tmc5160_read(motor->handle, 0x70, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "PWMCONF 0x%08" PRIx32, status);
-            }
-            if (tmc5160_read(motor->handle, 0x13, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "TPWMTHRS 0x%08" PRIx32, status);
-            }
-            if (tmc5160_read(motor->handle, 0x14, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "TCOOLTHRS 0x%08" PRIx32, status);
-            }
-            if (tmc5160_read(motor->handle, 0x15, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "THIGH 0x%08" PRIx32, status);
-            }
-            if (tmc5160_read(motor->handle, 0x6d, &status) == ESP_OK) {
-                ESP_LOGI(TAG, "COOLCONF 0x%08" PRIx32, status);
-            }
-#endif
         }
         esp_task_wdt_delete(NULL);
         ESP_LOGE(TAG, "dropped out with error (%s)!", esp_err_to_name(-err));
@@ -3784,12 +3705,6 @@ void app_main(void)
         tmc5160_motor_disable(motor->handle);
     }
     tmc5160_deinit();
-    if (motor->queue_stall) {
-        vQueueDelete(motor->queue_stall);
-    }
-#if defined CONFIG_TMC5160_DIAG_PIN && (CONFIG_TMC5160_DIAG_PIN >= 0)
-    tmc5160_deinit_stallguard(CONFIG_TMC5160_DIAG_PIN);
-#endif
     fgr_task_deinit();
     if (context->command_queue){
         vQueueDelete(context->command_queue);
