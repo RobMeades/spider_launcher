@@ -246,9 +246,7 @@ int32_t tmc5160_set_current(stepper_t *stepper,
 /** Set the acceleration/deceleration of the stepper motor
  * attached to a TMC5160 device.
  *
- * In velocity mode this controls both acceleration and
- * deceleration.  Higher values give more abrupt starts
- * and stops.
+ * Higher values give more abrupt starts.
  *
  * The default value set by tmc5160_create() is 1000.
  *
@@ -260,6 +258,23 @@ int32_t tmc5160_set_current(stepper_t *stepper,
  *                     code from esp_err_t.
  */
 int32_t tmc5160_set_acceleration(stepper_t *stepper,
+                                 uint32_t acceleration);
+
+/** Set the deceleration of the stepper motor attached to
+ * a TMC5160 device.
+ *
+ * Higher values give more abrupt stopts.
+ *
+ * The default value set by tmc5160_create() is 1000.
+ *
+ * @param stepper      the stepper instance that was returned
+ *                     by tmc5160_create().
+ * @param acceleration the value to write to the DMAX register,
+ *                     range 1 to 65535.
+ * @return             zero on success else negative error
+ *                     code from esp_err_t.
+ */
+int32_t tmc5160_set_deceleration(stepper_t *stepper,
                                  uint32_t acceleration);
 
 /** Set the velocity of the stepper motor attached to a
@@ -332,29 +347,23 @@ int32_t tmc5160_set_position(stepper_t *stepper, int32_t microsteps,
 int32_t tmc5160_set_chopper_mode(stepper_t *stepper,
                                  tmc5160_chopper_mode_t mode);
 
-/** Set the TSTEP value below which the TMC5160 will leave
- * leave SpreadCycle mode and switch to StealthChop mode,
+/** Set the velocity above which the TMC5160 will leave
+ * leave StealthChop mode and switch to SpreadCycle mode,
  * which is quiter and more efficient at higher speeds.
- * When TSTEP is low (higher speeds), StealthChop is better
- * because it is quieter and more efficient, however it can
- * cause motor stalls because of the clever current control.
+ * StealthChop is better because it is quieter and more
+ * efficient, however it can cause motor stalls because
+ * of the clever current control at higher speeds.
  *
- * Note: if you find you have to use SpreadCycle mode,
- * you may want to look at tmc5160_stop_that_bloody_racket().
- *
- * @param stepper    the stepper instance that was returned
- *                   by tmc5160_create().
- * @param threshold  the value of TSTEP below which
- *                   SpreadCycle should be abandoned for
- *                   StealthChop mode.  A special value of
- *                   0 means "always stay in StealthChop mode",
- *                   use UINT32_MAX to disable switching
- *                   to StealthChop entirely.
- * @return           zero on success else negative error
- *                   code from esp_err_t.
+ * @param stepper             the stepper instance that
+ *                            was returned by tmc5160_create().
+ * @param velocity_millihertz the velocity above which
+ *                            StealthChop mode should be
+ *                            abandoned for SpreadCycle.
+ * @return                    zero on success else negative
+ *                            error code from esp_err_t.
  */
-int32_t tmc5160_set_stealth_chop_threshold(stepper_t *stepper,
-                                           uint32_t threshold);
+int32_t tmc5160_set_spread_cycle_threshold(stepper_t *stepper,
+                                           uint32_t velocity_millihertz);
 
 /** Configure the chopper in a TMC5160, usually to stop
  * a motor sounding like a cricket in SpreadCycle mode,

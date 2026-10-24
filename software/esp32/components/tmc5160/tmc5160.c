@@ -967,8 +967,8 @@ int32_t tmc5160_set_current(stepper_t *stepper,
     return err;
 }
 
-// Set the acceleration/deceleration of the stepper motor
-// attached to a TMC5160 device.
+// Set the acceleration of the stepper motor attached to
+// a TMC5160 device.
 int32_t tmc5160_set_acceleration(stepper_t *stepper,
                                  uint32_t acceleration)
 {
@@ -986,6 +986,30 @@ int32_t tmc5160_set_acceleration(stepper_t *stepper,
         }
 
         CONTEXT_UNLOCK(g_context.lock, "tmc5160_set_acceleration()");
+    }
+
+    return err;
+}
+
+// Set the deceleration of the stepper motor attached to
+// a TMC5160 device.
+int32_t tmc5160_set_deceleration(stepper_t *stepper,
+                                 uint32_t deceleration)
+{
+    int32_t err = -ESP_ERR_INVALID_STATE;
+
+    if (g_context.spi != NULL) {
+
+        CONTEXT_LOCK(g_context.lock, "tmc5160_set_deceleration()");
+
+        err = -ESP_ERR_INVALID_ARG;
+        if (stepper && (deceleration > 0) &&
+            (deceleration <= 0xFFFF)) {
+            // Write to the DMAX register (0x28)
+            err = write_reg(stepper, 0x28, deceleration);
+        }
+
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_set_deceleration()");
     }
 
     return err;
@@ -1168,22 +1192,42 @@ int32_t tmc5160_set_chopper_mode(stepper_t *stepper,
     return err;
 }
 
-// Set the StealthChop threshold.
-int32_t tmc5160_set_stealth_chop_threshold(stepper_t *stepper,
-                                           uint32_t threshold)
+// Set the SpreadCycle threshold.
+int32_t tmc5160_set_spread_cycle_threshold(stepper_t *stepper,
+                                           uint32_t velocity_millihertz)
 {
-
     int32_t err = -ESP_ERR_INVALID_STATE;
+    uint32_t threshold = 0;
 
     if (g_context.spi != NULL) {
 
-        CONTEXT_LOCK(g_context.lock, "tmc5160_set_stealth_chop_threshold()");
+        CONTEXT_LOCK(g_context.lock, "tmc5160_set_spread_cycle_threshold()");
+
+        if (velocity_millihertz != 0) {
+            uint64_t numerator = TMC5160_CLOCK_HZ * 1000ULL;
+            uint64_t denominator =
+                256ULL * MOTOR_STEPS_PER_REV * velocity_millihertz;
+
+            // Round to nearest integer.
+            uint64_t value = (numerator + denominator / 2) / denominator;
+
+            // TPWMTHRS is a 20-bit register.
+            if (value > 0xFFFFF) {
+                value = 0xFFFFF;
+            }
+
+            // Avoid unintentionally disabling the threshold.
+            if (value == 0) {
+                value = 1;
+            }
+
+            threshold = (uint32_t)value;
+        }
 
         // Write to the TPWMTHRS register (0x13)
         err = write_reg(stepper, 0x13, threshold);
 
-        CONTEXT_UNLOCK(g_context.lock, "tmc5160_set_stealth_chop_threshold()");
-
+        CONTEXT_UNLOCK(g_context.lock, "tmc5160_set_spread_cycle_threshold()");
     }
 
     return err;

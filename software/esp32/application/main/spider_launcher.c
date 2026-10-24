@@ -52,6 +52,7 @@
 #include "esp_log_level.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/projdefs.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_event.h"
@@ -124,8 +125,11 @@
 // The microstep resolution for the motor (1 to 256 in powers of two).
 #define TMC5160_MICROSTEP_RESOLUTION 256
 
+// How much current to feed to the stepper motor when idle.
+#define TMC5160_IDLE_CURRENT_MA 500
+
 // How much current to feed to the stepper motor when running.
-#define TMC5160_RUN_CURRENT_MA 500
+#define TMC5160_RUN_CURRENT_MA 1000
 
 // The percentage to apply to the run current when holding.
 #define TMC5160_HOLD_CURRENT_PERCENT 50
@@ -135,6 +139,20 @@
 
 // Abrupt acceleration, for use with tmc5160_set_acceleration.
 #define TMC5160_ACCELERATION_ABRUPT 10000
+
+// Normal deceleration, for use with tmc5160_set_deceleration().
+#define TMC5160_DECELERATION_NORMAL 1000
+
+// Abrupt deceleration, for use with tmc5160_set_deceleration().
+#define TMC5160_DECELERATION_ABRUPT 10000
+
+// Delay after stopping the motor to when we assume it has stopped
+// (and can therefore safely switch current)
+#define TMC5160_STOP_TIME_MS 1200
+
+// The threshold at which we switch from Stealth Chop to
+// Spread Cycle for extra oomph in millimetres per second.
+#define TMC5160_SPREAD_CYCLE_THRESHOLD_MM_PER_SECOND 600
 
 // An unused track number (if it gets played nothing will happen).
 #define TRACK_NUMBER_UNUSED 0
@@ -223,14 +241,23 @@
 #  error "DEFAULT_SPEED_MM_PER_SECOND must be at least SPEED_MIN_MM_PER_SECOND"
 #endif
 
-// How long to spend joggling the spider to wake it up.
-#define WAKING_DURATION_MS 1000
+// The height of fall needed to trigger the spider's motion sensor.
+#define WAKING_JIGGLE_HEIGHT_MM 150
 
-// How high a step to take to jiggle the spider away during waking
-#define WAKING_JIGGLE_HEIGHT_MM 50
+// The number of falls to trigger the spider's motion sensor reliably.
+#define WAKING_JIGGLE_CYCLES 1
 
-// How long to pause between joggles when waking the spider.
-#define WAKING_STOP_MS 250
+// How fast to raise and drop the spider while waking it.
+#define WAKING_SPEED_MM_PER_SECOND 1500
+
+// A nice high acceleration for the wake-up.
+#define WAKING_ACCELERATION 30000
+
+// A high enough deceleration to switch on the eyes.
+#define WAKING_DECELERATION 1500
+
+// Pause for the poor thing to recover.
+#define WAKING_SETTLE_TIME_MS 0
 
 // How long to dangle for at the top of the run.
 #define DANGLE_TIME_SECONDS 8
@@ -249,6 +276,9 @@
 
 // How long to leave between jerky movements in milliseconds.
 #define RANDOM_PAUSE_INTERVAL_MS 250
+
+// Put the spider down nice and gently to avoid turning its eyes on again.
+#define RESETTING_DECELERATION 100
 
 // How long to keep the IO lines at the signalled level when running
 // the audio board in IO mode.
@@ -353,6 +383,7 @@ typedef struct {
 // Structure to hold motor data
 typedef struct {
     stepper_t *handle;
+    uint32_t last_current_setting_ma;
     TaskHandle_t task_stall;
     QueueHandle_t queue_stall;
 } launcher_motor_t;
@@ -367,6 +398,7 @@ typedef struct {
     launcher_timer_t timer_a;
     launcher_timer_t timer_b;
     bool temporary_stop;
+    uint32_t waking_cycles_completed;
     TaskHandle_t task_auto;
     uint32_t auto_period_seconds;
     launcher_timer_t timer_auto;
@@ -481,7 +513,7 @@ _Static_assert (FGR_UTIL_ARRAY_LENGTH(g_launcher_state_colour) == LAUNCHER_STATE
 // The durations of the known audio tracks, in order of track number
 // noting that 0 is unused
 static const uint32_t g_track_duration_ms[] = {0, 1000, 1000, 1000,
-                                               14000, 11000, 1000, 1000,
+                                               14000, 10000, 1000, 1000,
                                                1000, 1000};
 
 // THERE ARE MORE VARIABLES FURTHER DOWN
@@ -852,7 +884,6 @@ static uint8_t audio_play_set_pin(uint32_t track_number, int32_t bit_mask, int32
         resulting_bit_pattern = ~resulting_bit_pattern;
     }
     gpio_set_level(pin, track_number & bit_mask ? highNotLow : !highNotLow);
-    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
 
     return resulting_bit_pattern;
 }
@@ -904,7 +935,7 @@ static void audio_play_track(uint32_t track_number)
     bit_pattern &= audio_play_set_pin(track_number, 0x02, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1, false);
     bit_count++;
 #  endif
-#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2 >= 0)
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2 >= 0)
     bit_pattern &= audio_play_set_pin(track_number, 0x04, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2, false);
     bit_count++;
 #  endif
@@ -1220,6 +1251,23 @@ static void motor_stall_task_cb(void *handle, void *arg)
     }
 }
 
+// Set the motor current.
+static void motor_set_current_ma(launcher_motor_t *motor, uint32_t current_ma)
+{
+    // Set the motor current
+    int32_t err = tmc5160_set_current(motor->handle, TMC5160_RSENSE_MOHM,
+                                      current_ma,
+                                      TMC5160_HOLD_CURRENT_PERCENT);
+    if (err >= 0) {
+        ESP_LOGI(TAG, "motor current set to %d mA.", err);
+        motor->last_current_setting_ma = current_ma;
+        err = ESP_OK;
+    } else {
+        ESP_LOGW(TAG, "unable to set motor current to %d mA (%s)!",
+                 current_ma, esp_err_to_name(-err));
+    }
+}
+
 // Get the current position from the motor.
 static int32_t motor_get_position_mm(launcher_motor_t *motor)
 {
@@ -1239,7 +1287,8 @@ static int32_t motor_get_position_mm(launcher_motor_t *motor)
 // Start the motor moving at the given speed.
 static void motor_set_speed(launcher_motor_t *motor, bool direction_up_not_down,
                             uint32_t abs_speed_mm_per_second,
-                            uint32_t speed_modifier_percent, uint32_t acceleration)
+                            uint32_t speed_modifier_percent, uint32_t current_ma,
+                            uint32_t acceleration, uint32_t deceleration)
 {
     int32_t speed_mm_per_second = abs_speed_mm_per_second * speed_modifier_percent / 100;
     if (!direction_up_not_down) {
@@ -1247,15 +1296,25 @@ static void motor_set_speed(launcher_motor_t *motor, bool direction_up_not_down,
     }
 
     // Make sure the motor is enabled
+    motor_set_current_ma(motor, current_ma);
     int32_t err = tmc5160_motor_enable(motor->handle);
     if (err == ESP_OK) {
-        tmc5160_set_acceleration(motor->handle, acceleration);
+        err = tmc5160_set_acceleration(motor->handle, acceleration);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "unable to set acceleration to %d (%s)!", acceleration,
+                     esp_err_to_name(-err));
+        }
+        err = tmc5160_set_deceleration(motor->handle, deceleration);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "unable to set deceleration to %d (%s)!", deceleration,
+                     esp_err_to_name(-err));
+        }
         int32_t millihertz = speed_mm_per_second_to_millihertz(speed_mm_per_second);
         int32_t err = tmc5160_set_velocity(motor->handle, millihertz);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "speed set to %d mm/s (%d milliHertz).", speed_mm_per_second, millihertz);
         } else {
-            ESP_LOGE(TAG, "unable to set speed to %d mm/s (%d milliHertz) (%s).",
+            ESP_LOGE(TAG, "unable to set speed to %d mm/s (%d milliHertz) (%s)!",
                      speed_mm_per_second, millihertz, esp_err_to_name(-err));
         }
     } else {
@@ -1266,20 +1325,31 @@ static void motor_set_speed(launcher_motor_t *motor, bool direction_up_not_down,
 // Move the winch to the given height.
 static void motor_set_height_mm(launcher_motor_t *motor, uint32_t height_mm,
                                 uint32_t abs_speed_mm_per_second,
-                                int32_t ground_level_mm, uint32_t acceleration)
+                                int32_t ground_level_mm, uint32_t current_ma,
+                                uint32_t acceleration, uint32_t deceleration)
 {
     int32_t position_mm = ground_level_mm + height_mm;
     int32_t microsteps = height_to_microsteps(position_mm);
     int32_t abs_speed_millihertz = speed_mm_per_second_to_millihertz(abs_speed_mm_per_second);
 
+    motor_set_current_ma(motor, current_ma);
     // Make sure the motor is enabled
     int32_t err = tmc5160_motor_enable(motor->handle);
     if (err == ESP_OK) {
-        tmc5160_set_acceleration(motor->handle, acceleration);
+        err = tmc5160_set_acceleration(motor->handle, acceleration);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "unable to set acceleration to %d (%s)!", acceleration,
+                     esp_err_to_name(-err));
+        }
+        err = tmc5160_set_deceleration(motor->handle, deceleration);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "unable to set deceleration to %d (%s)!", deceleration,
+                     esp_err_to_name(-err));
+        }
         err = tmc5160_set_position(motor->handle, microsteps, abs_speed_millihertz);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "target height set to %d mm (%d microsteps),"
-                    "max speed %d mm/second (%d milliHertz).", height_mm, microsteps,
+                    " max speed %d mm/second (%d milliHertz).", height_mm, microsteps,
                     abs_speed_mm_per_second, abs_speed_millihertz);
         } else {
             ESP_LOGE(TAG, "unable to set target height to %d mm (%d microsteps) (%s).",
@@ -1290,17 +1360,56 @@ static void motor_set_height_mm(launcher_motor_t *motor, uint32_t height_mm,
     }
 }
 
+// Wait for the motor to stop.
+static bool motor_wait_until_stopped(launcher_motor_t *motor)
+{
+    bool motor_has_stopped = false;
+    int32_t err = ESP_OK;
+    int64_t start_us = esp_timer_get_time();
+
+    while ((esp_timer_get_time() - start_us <  TMC5160_STOP_TIME_MS * 1000) && !motor_has_stopped && (err == ESP_OK)) {
+        int32_t velocity = 0;
+        err = tmc5160_get_velocity(motor->handle, &velocity);
+
+        if (err == ESP_OK) {
+            motor_has_stopped = (velocity == 0);
+        } else {
+            ESP_LOGW(TAG, "unable to read motor velocity (%s)!", esp_err_to_name(-err));
+        }
+
+        if (!motor_has_stopped && (err == ESP_OK)) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (err == ESP_OK) {
+        if (motor_has_stopped) {
+            ESP_LOGI(TAG, "motor took %lld ms to stop.",  (esp_timer_get_time() - start_us) / 1000);
+        } else {
+            ESP_LOGW(TAG, "motor did not stop within %d ms!", TMC5160_STOP_TIME_MS);
+        }
+    }
+
+    return motor_has_stopped;
+}
+
 // Stop the motor.
-static void motor_stop(launcher_motor_t *motor, bool and_hold)
+static void motor_stop(launcher_motor_t *motor, uint32_t current_ma, bool emergency)
 {
     int32_t err = tmc5160_set_velocity(motor->handle, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "unable to stop the motor (%s).", esp_err_to_name(-err));
     }
-    if (!and_hold) {
+    // If we're reducing the current, wait for the motor to stop
+    // at the old current setting and then change it
+    if (!emergency && (current_ma < motor->last_current_setting_ma)) {
+        motor_wait_until_stopped(motor);
+    }
+    motor_set_current_ma(motor, current_ma);
+    if (emergency) {
         err = tmc5160_motor_disable(motor->handle);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "unable to disable motor (%s).", esp_err_to_name(-err));
+            ESP_LOGE(TAG, "unable to disable the motor (%s).", esp_err_to_name(-err));
         }
     }
 }
@@ -1388,23 +1497,6 @@ static void set_led_breathe_colour(launcher_state_t state, bool emergency_stoppe
     }
 }
 
-// Modify a height with limits
-static int32_t height_modify_and_limit(int32_t height_mm,
-                                       int32_t height_change_mm,
-                                       int32_t height_max_mm)
-{
-    int32_t height_target_mm = height_mm + height_change_mm;
-
-    if (height_target_mm > height_max_mm) {
-        height_target_mm = height_max_mm;
-    }
-    if (height_target_mm < 0) {
-        height_target_mm = 0;
-    }
-
-    return height_target_mm;
-}
-
 // Advance state based on commanded state LAUNCHER_STATE_MOVE_UP.
 static launcher_state_t advance_state_commanded_move_up(launcher_t *launcher,
                                                         int32_t height_mm,
@@ -1429,7 +1521,7 @@ static launcher_state_t advance_state_commanded_move_up(launcher_t *launcher,
         // Move up
         motor_set_speed(&launcher->motor, launcher->direction_up_not_down,
                         nvs_shadow->speed_mm_per_second, MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT,
-                        TMC5160_ACCELERATION_NORMAL);
+                        TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
         next_state = LAUNCHER_STATE_MOVE_UP;
     } else {
         ESP_LOGW(TAG, "ignoring move up, already at limit (step %d (%d mm)).",
@@ -1460,7 +1552,7 @@ static launcher_state_t advance_state_commanded_move_down(launcher_t *launcher,
 
     motor_set_speed(&launcher->motor, launcher->direction_up_not_down,
                     nvs_shadow->speed_mm_per_second, MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT,
-                     TMC5160_ACCELERATION_NORMAL);
+                    TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
     next_state = LAUNCHER_STATE_MOVE_DOWN;
 
     return next_state;
@@ -1480,7 +1572,7 @@ static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
         uint32_t track_number = nvs_shadow->track_number_skittering;
         int64_t duration_us = 0;
         if (track_number < FGR_UTIL_ARRAY_LENGTH(g_track_duration_ms)) {
-            duration_us = g_track_duration_ms[track_number] * 1000;
+            duration_us = ((int64_t) g_track_duration_ms[track_number]) * 1000;
         }
         timer_start_us(&launcher->timer_a, duration_us);
 
@@ -1488,7 +1580,7 @@ static launcher_state_t advance_state_commanded_run(launcher_t *launcher,
         if (!nvs_shadow->mute) {
             audio_play_track(track_number);
         }
-        ESP_LOGI(TAG, "playing skittering noise for %d second(s).", duration_us / 1000000);
+        ESP_LOGI(TAG, "playing skittering noise for %lld second(s).", duration_us / 1000000);
         next_state = LAUNCHER_STATE_RUNNING_SKITTERING;
     } else {
         ESP_LOGW(TAG, "ignoring run, already at limit (height %d (max %d mm)).",
@@ -1510,29 +1602,25 @@ static launcher_state_t advance_state_running_skittering(launcher_t *launcher,
     // Wait for the skittering time to pass
     if (timer_has_expired(&launcher->timer_a)) {
         // Prepare for waking
-        timer_start_us(&launcher->timer_a, WAKING_DURATION_MS * 1000);
         launcher->temporary_stop = false;
         launcher->direction_up_not_down = true;
-        // Start audio
-        if (!nvs_shadow->mute) {
-            audio_play_track(nvs_shadow->track_number_jumping);
+        launcher->waking_cycles_completed = 0;
+        // Start waking with a sharp lift
+        launcher->height_target_mm = WAKING_JIGGLE_HEIGHT_MM;
+        if (launcher->height_target_mm > height_max_mm) {
+            launcher->height_target_mm = height_max_mm;
         }
-        // Start waking
-        launcher->height_target_mm = height_modify_and_limit(height_mm,
-                                                             WAKING_JIGGLE_HEIGHT_MM,
-                                                             height_max_mm);
-        ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm,
-                 launcher->height_target_mm);
+        ESP_LOGI(TAG, "waking: lifting to %d mm.", launcher->height_target_mm);
         motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
                             nvs_shadow->speed_mm_per_second, ground_level_mm,
-                           TMC5160_ACCELERATION_ABRUPT);
+                            TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
         next_state = LAUNCHER_STATE_RUNNING_WAKING;
     }
 
     return next_state;
 }
 
-// Advance state based on state LAUNCHER_STATE_WAKING.
+// Advance state based on state LAUNCHER_STATE_RUNNING_WAKING.
 static launcher_state_t advance_state_running_waking(launcher_t *launcher,
                                                      int32_t height_mm,
                                                      int32_t height_max_mm,
@@ -1541,42 +1629,83 @@ static launcher_state_t advance_state_running_waking(launcher_t *launcher,
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     nvs_shadow_t *nvs_shadow = &launcher->nvs_shadow;
 
-    // Wait for the waking time to pass
-    if (timer_has_expired(&launcher->timer_a)) {
-        // Prepare for randomness
-        timer_start_us(&launcher->timer_a, RANDOM_PAUSE_INTERVAL_MS * 1000);
-        timer_start_us(&launcher->timer_b, RANDOM_PAUSE_TIME_MS * 1000);
-        launcher->temporary_stop = false;
-        // Start jumping
-        launcher->height_target_mm = height_max_mm;
-        launcher->direction_up_not_down = true;
-        ESP_LOGI(TAG, "height_mm %d, height_target_mm %d%s.", height_mm, launcher->height_target_mm,
-                 nvs_shadow->random_enabled ? " (random is enabled)" : "");
-        motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
-                            nvs_shadow->speed_mm_per_second, ground_level_mm,
-                            TMC5160_ACCELERATION_ABRUPT);
-        next_state = LAUNCHER_STATE_RUNNING_JUMPING;
-    } else {
-        // Continue waking up the spider
-        if (launcher->temporary_stop) {
-            if (timer_has_expired(&launcher->timer_b)) {
-                launcher->temporary_stop = false;
-                launcher->height_target_mm = height_modify_and_limit(height_mm,
-                                                                     WAKING_JIGGLE_HEIGHT_MM,
-                                                                     height_max_mm);
-                ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm,
-                         launcher->height_target_mm);
-                motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
-                                    nvs_shadow->speed_mm_per_second, ground_level_mm,
-                                    TMC5160_ACCELERATION_ABRUPT);
+    (void) height_max_mm;
 
+    if (launcher->direction_up_not_down) {
+        // Currently lifting the spider.
+        if (height_mm >= launcher->height_target_mm) {
+            // Reached the top: return to ground level.
+            launcher->direction_up_not_down = false;
+            launcher->height_target_mm = 0;
+            ESP_LOGI(TAG, "waking: lowering to ground.");
+            motor_set_height_mm(&launcher->motor,
+                                0,
+                                WAKING_SPEED_MM_PER_SECOND,
+                                ground_level_mm,
+                                TMC5160_RUN_CURRENT_MA,
+                                WAKING_ACCELERATION,
+                                WAKING_DECELERATION);
+        }
+    } else {
+        // Currently lowering the spider.
+        if (height_mm <= launcher->height_target_mm) {
+            // Reached ground level: one complete jiggle.
+            if (!launcher->temporary_stop) {
+                launcher->waking_cycles_completed++;
+                ESP_LOGI(TAG, "waking: completed jiggle %d of %d.",
+                        launcher->waking_cycles_completed, WAKING_JIGGLE_CYCLES);
             }
-        } else {
-            if (height_mm >= launcher->height_target_mm) {
-                timer_start_us(&launcher->timer_b, WAKING_STOP_MS * 1000);
-                launcher->temporary_stop = true;
-                ESP_LOGI(TAG, "stopping for %d ms.", WAKING_STOP_MS);
-                motor_stop(&launcher->motor, true);
+            if (launcher->waking_cycles_completed < WAKING_JIGGLE_CYCLES) {
+                if (launcher->temporary_stop) {
+                    if (timer_has_expired(&launcher->timer_a)) {
+                        // Another jiggle: lift again.
+                        launcher->temporary_stop = false;
+                        launcher->direction_up_not_down = true;
+                        launcher->height_target_mm = WAKING_JIGGLE_HEIGHT_MM;
+                        if (launcher->height_target_mm > height_max_mm) {
+                            launcher->height_target_mm = height_max_mm;
+                        }
+                        ESP_LOGI(TAG, "waking: lifting to %d mm.",
+                                launcher->height_target_mm);
+                        motor_set_height_mm(&launcher->motor,
+                                            launcher->height_target_mm,
+                                            WAKING_SPEED_MM_PER_SECOND,
+                                            ground_level_mm,
+                                            TMC5160_RUN_CURRENT_MA,
+                                            WAKING_ACCELERATION,
+                                            WAKING_DECELERATION);
+                    }
+                } else {
+                    timer_start_us(&launcher->timer_a,
+                                   WAKING_SETTLE_TIME_MS * 1000);
+                    launcher->temporary_stop = true;
+                }
+            } else {
+                // Waking complete: prepare for random movements.
+                timer_start_us(&launcher->timer_a,
+                               RANDOM_PAUSE_INTERVAL_MS * 1000);
+                timer_start_us(&launcher->timer_b,
+                               RANDOM_PAUSE_TIME_MS * 1000);
+                launcher->temporary_stop = false;
+                // Start jumping.
+                launcher->height_target_mm = height_max_mm;
+                launcher->direction_up_not_down = true;
+                // Start audio
+                if (!nvs_shadow->mute) {
+                    audio_play_track(nvs_shadow->track_number_jumping);
+                }
+                ESP_LOGI(TAG, "height_mm %d, height_target_mm %d%s.",
+                         height_mm, launcher->height_target_mm,
+                         nvs_shadow->random_enabled ?
+                         " (random is enabled)" : "");
+                motor_set_height_mm(&launcher->motor,
+                                    launcher->height_target_mm,
+                                    nvs_shadow->speed_mm_per_second,
+                                    ground_level_mm,
+                                    TMC5160_RUN_CURRENT_MA,
+                                    TMC5160_ACCELERATION_ABRUPT,
+                                    TMC5160_DECELERATION_ABRUPT);
+                next_state = LAUNCHER_STATE_RUNNING_JUMPING;
             }
         }
     }
@@ -1600,7 +1729,7 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
                 if (esp_random() < UINT32_MAX / 2) {
                     ESP_LOGI(TAG, "random stop for %d ms.", RANDOM_PAUSE_TIME_MS);
                     timer_start_us(&launcher->timer_a, RANDOM_PAUSE_TIME_MS * 1000);
-                    motor_stop(&launcher->motor, true);
+                    motor_stop(&launcher->motor, TMC5160_RUN_CURRENT_MA, false);
                     launcher->temporary_stop = true;
                 } else {
                     ESP_LOGI(TAG, "won't stop randomly for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
@@ -1613,7 +1742,7 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
                 ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm, launcher->height_target_mm);
                 motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
                                     nvs_shadow->speed_mm_per_second, ground_level_mm,
-                                    TMC5160_ACCELERATION_ABRUPT);
+                                    TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_ABRUPT, TMC5160_DECELERATION_ABRUPT);
                 timer_start_us(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
                 launcher->temporary_stop = false;
             }
@@ -1621,7 +1750,7 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
     } else {
         // Done.
         launcher->height_target_mm = POSITION_UNKNOWN;
-        motor_stop(&launcher->motor, true);
+        motor_stop(&launcher->motor, TMC5160_RUN_CURRENT_MA,  false);
         print_height(height_mm);
         timer_start_us(&launcher->timer_a, DANGLE_TIME_SECONDS * 1000000);
         // Start audio
@@ -1656,7 +1785,7 @@ static launcher_state_t advance_state_running_dangling(launcher_t *launcher,
         ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm, launcher->height_target_mm);
         motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
                             nvs_shadow->speed_mm_per_second * RESETTING_SPEED_MODIFIER_PERCENT / 100,
-                            ground_level_mm, TMC5160_ACCELERATION_NORMAL);
+                            ground_level_mm, TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, RESETTING_DECELERATION);
         next_state = LAUNCHER_STATE_RUNNING_RESETTING;
     }
 
@@ -1672,7 +1801,7 @@ static launcher_state_t advance_state_running_resetting(launcher_t *launcher,
     if ((height_mm != POSITION_UNKNOWN) && (height_mm <= launcher->height_target_mm)) {
         // Done.
         launcher->height_target_mm = POSITION_UNKNOWN;
-        motor_stop(&launcher->motor, true);
+        motor_stop(&launcher->motor, TMC5160_IDLE_CURRENT_MA, false);
         print_height(height_mm);
         next_state = LAUNCHER_STATE_POSITION_UNKNOWN;
     }
@@ -1702,11 +1831,17 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
         }
     }
     int32_t height_max_mm = nvs_shadow->height_max_mm;
+    // When an up or down move, or a halt, is over, reduce the
+    // current if we're at ground level
+    uint32_t up_down_final_current_ma = TMC5160_RUN_CURRENT_MA;
+    if ((height_mm != POSITION_UNKNOWN) && (height_mm <= 0)) {
+        up_down_final_current_ma = TMC5160_IDLE_CURRENT_MA;
+    }
 
     launcher_state_t next_state = LAUNCHER_STATE_NULL;
     if (commanded_state == LAUNCHER_STATE_HALT) {
         // A command to halt overrides everything else
-        motor_stop(&launcher->motor, true);
+        motor_stop(&launcher->motor, up_down_final_current_ma, retained_ram->emergency_stopped);
         next_state = commanded_state;
     } else {
         // Handle the current state
@@ -1774,7 +1909,7 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                     (height_mm >= height_max_mm))) {
                     // Done.
                     launcher->height_target_mm = POSITION_UNKNOWN;
-                    motor_stop(&launcher->motor, true);
+                    motor_stop(&launcher->motor, up_down_final_current_ma, false);
                     print_height_from_position(position_mm, ground_level_mm);
                     next_state = LAUNCHER_STATE_POSITION_UNKNOWN;
                 }
@@ -1789,7 +1924,7 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
                     // Note: stepping down should work irrespective of ground level as this might
                     // be an operation to reset where the ground level is
                     launcher->height_target_mm = POSITION_UNKNOWN;
-                    motor_stop(&launcher->motor, true);
+                    motor_stop(&launcher->motor, up_down_final_current_ma, false);
                     print_height_from_position(position_mm, ground_level_mm);
                     next_state = LAUNCHER_STATE_POSITION_UNKNOWN;
                 }
@@ -2102,10 +2237,16 @@ static void handler_emergency_stop_enable(launcher_t *launcher, uint32_t enable,
     if (FGR_RRAM_GET(retained_ram) == ESP_OK) {
         previous_stopped_state = retained_ram.emergency_stopped;
         retained_ram.emergency_stopped = enable;
+        // The motor will be off after an emergency stop so
+        // the spider may sag, ground level is no longer known
+        if (enable) {
+            retained_ram.ground_level_mm = POSITION_UNKNOWN;
+        }
         FGR_RRAM_SET(retained_ram);
     }
     // Either kick the state machine back into life or halt it
     if (enable) {
+        FGR_RRAM_SET(retained_ram);
         launcher_state_t state = LAUNCHER_STATE_HALT;
         xQueueSend(launcher->queue_state, &state, portMAX_DELAY);
     } else {
@@ -3265,12 +3406,27 @@ static int32_t init(context_t *context)
                         }
                     }
                     if (err == ESP_OK) {
+                        // Set a threshold to switch to spread cycle
+                        err = tmc5160_set_spread_cycle_threshold(motor->handle,
+                                                                 speed_mm_per_second_to_millihertz(TMC5160_SPREAD_CYCLE_THRESHOLD_MM_PER_SECOND));
+                        if (err == ESP_OK) {
+                            ESP_LOGI(TAG, "spread cycle threshold set to %d mm/second.",
+                                     TMC5160_SPREAD_CYCLE_THRESHOLD_MM_PER_SECOND);
+                            err = ESP_OK;
+                        } else {
+                            ESP_LOGE(TAG, "unable to set spread cycle threshold to %d mm/second!",
+                                     TMC5160_SPREAD_CYCLE_THRESHOLD_MM_PER_SECOND,
+                                     esp_err_to_name(-err));
+                        }
+                    }
+                    if (err == ESP_OK) {
                         // Set the motor current
                         err = tmc5160_set_current(motor->handle, TMC5160_RSENSE_MOHM,
                                                   TMC5160_RUN_CURRENT_MA,
                                                   TMC5160_HOLD_CURRENT_PERCENT);
                         if (err >= 0) {
                             ESP_LOGI(TAG, "motor current set to %d mA.", err);
+                            motor->last_current_setting_ma = TMC5160_RUN_CURRENT_MA;
                             err = ESP_OK;
                         } else {
                             ESP_LOGE(TAG, "unable to set motor current to %d mA (%s)!",
@@ -3310,7 +3466,6 @@ static int32_t init(context_t *context)
                     //                        motor_stall_interrupt_handler, motor);
                 }
 #endif
-
             }
         }
 
@@ -3371,7 +3526,9 @@ static int32_t init(context_t *context)
                                                 nvs_shadow->speed_mm_per_second *
                                                 RESETTING_SPEED_MODIFIER_PERCENT / 100,
                                                 retained_ram.ground_level_mm,
-                                                TMC5160_ACCELERATION_NORMAL);
+                                                TMC5160_RUN_CURRENT_MA,
+                                                TMC5160_ACCELERATION_NORMAL,
+                                                TMC5160_DECELERATION_NORMAL);
 
                             launcher->state = LAUNCHER_STATE_RUNNING_RESETTING;
                         }
@@ -3409,16 +3566,20 @@ static int32_t init(context_t *context)
 #else
     // Set the pins that control the audio track all high so that they can be pulled low
 #  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0 >= 0)
-    audio_play_set_pin(0xF, 0x01, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0, true);
+    gpio_set_level(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0, 1);
+    gpio_set_direction(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_0, GPIO_MODE_OUTPUT);
 #  endif
 #  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1 >= 0)
-    audio_play_set_pin(0xF, 0x02, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1, true);
+    gpio_set_level(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1, 1);
+    gpio_set_direction(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_1, GPIO_MODE_OUTPUT);
 #  endif
-#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2 >= 0)
-    audio_play_set_pin(0xF, 0x04, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2, true);
+#  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2 >= 0)
+    gpio_set_level(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2, 1);
+    gpio_set_direction(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_2, GPIO_MODE_OUTPUT);
 #  endif
 #  if defined(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3) && (CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3 >= 0)
-    audio_play_set_pin(0xF, 0x08, CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3, true);
+    gpio_set_level(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3, 1);
+    gpio_set_direction(CONFIG_SPIDER_LAUNCHER_AUDIO_PIN_3, GPIO_MODE_OUTPUT);
 #  endif
 #endif
 
