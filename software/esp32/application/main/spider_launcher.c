@@ -242,7 +242,7 @@
 #endif
 
 // The height of fall needed to trigger the spider's motion sensor.
-#define WAKING_JIGGLE_HEIGHT_MM 150
+#define WAKING_JIGGLE_HEIGHT_MM 50
 
 // The number of falls to trigger the spider's motion sensor reliably.
 #define WAKING_JIGGLE_CYCLES 1
