@@ -129,7 +129,7 @@
 #define TMC5160_IDLE_CURRENT_MA 500
 
 // How much current to feed to the stepper motor when running.
-#define TMC5160_RUN_CURRENT_MA 1000
+#define TMC5160_RUN_CURRENT_MA 1500
 
 // The percentage to apply to the run current when holding.
 #define TMC5160_HOLD_CURRENT_PERCENT 50
@@ -247,14 +247,14 @@
 // The number of falls to trigger the spider's motion sensor reliably.
 #define WAKING_JIGGLE_CYCLES 1
 
-// How fast to raise and drop the spider while waking it.
-#define WAKING_SPEED_MM_PER_SECOND 1500
+// How fast to drop the spider while waking it.
+#define WAKING_SPEED_DOWN_MM_PER_SECOND 1500
 
-// A nice high acceleration for the wake-up.
-#define WAKING_ACCELERATION 30000
+// A acceleration for the wake-up, downwards direction.
+#define WAKING_DOWN_ACCELERATION 30000
 
-// A high enough deceleration to switch on the eyes.
-#define WAKING_DECELERATION 1500
+// A high enough downwards deceleration to switch on the eyes.
+#define WAKING_DOWN_DECELERATION 1500
 
 // Pause for the poor thing to recover.
 #define WAKING_SETTLE_TIME_MS 0
@@ -1611,11 +1611,11 @@ static launcher_state_t advance_state_running_waking(launcher_t *launcher,
             ESP_LOGI(TAG, "waking: lowering to ground.");
             motor_set_height_mm(&launcher->motor,
                                 0,
-                                WAKING_SPEED_MM_PER_SECOND,
+                                WAKING_SPEED_DOWN_MM_PER_SECOND,
                                 ground_level_mm,
                                 TMC5160_RUN_CURRENT_MA,
-                                WAKING_ACCELERATION,
-                                WAKING_DECELERATION);
+                                WAKING_DOWN_ACCELERATION,
+                                WAKING_DOWN_DECELERATION);
         }
     } else {
         // Currently lowering the spider.
@@ -1640,11 +1640,11 @@ static launcher_state_t advance_state_running_waking(launcher_t *launcher,
                                 launcher->height_target_mm);
                         motor_set_height_mm(&launcher->motor,
                                             launcher->height_target_mm,
-                                            WAKING_SPEED_MM_PER_SECOND,
+                                            nvs_shadow->speed_mm_per_second,
                                             ground_level_mm,
                                             TMC5160_RUN_CURRENT_MA,
-                                            WAKING_ACCELERATION,
-                                            WAKING_DECELERATION);
+                                            TMC5160_ACCELERATION_ABRUPT,
+                                            TMC5160_DECELERATION_ABRUPT);
                     }
                 } else {
                     timer_start_us(&launcher->timer_a,

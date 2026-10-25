@@ -1228,7 +1228,6 @@ int32_t tmc5160_configure_chopper(stepper_t *stepper,
         }
 
         CONTEXT_UNLOCK(g_context.lock, "tmc5160_configure_chopper()");
-
     }
 
     return err;
