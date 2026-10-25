@@ -1581,15 +1581,6 @@ static launcher_state_t advance_state_running_skittering(launcher_t *launcher,
             launcher->height_target_mm = height_max_mm;
         }
 
-        // Enable sg_stop.
-        uint32_t data;
-        if (tmc5160_read(launcher->motor.handle, 0x34, &data) == ESP_OK) {
-            data |= 1UL << 10;
-            if (tmc5160_write(launcher->motor.handle, 0x34, data) == ESP_OK) {
-               ESP_LOGI(TAG, "sg_stop ENABLED");
-            }
-        }
-
         ESP_LOGI(TAG, "waking: lifting to %d mm.", launcher->height_target_mm);
         motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
                             nvs_shadow->speed_mm_per_second, ground_level_mm,
