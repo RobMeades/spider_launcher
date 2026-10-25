@@ -128,8 +128,11 @@
 // How much current to feed to the stepper motor when idle.
 #define TMC5160_IDLE_CURRENT_MA 500
 
-// How much current to feed to the stepper motor when running.
-#define TMC5160_RUN_CURRENT_MA 1500
+// How much current to feed to the stepper motor when lifting.
+#define TMC5160_LIFT_CURRENT_MA 2000
+
+// How much current to feed to the stepper motor when hanging or returing.
+#define TMC5160_HANGING_RETURNING_CURRENT_MA 1000
 
 // The percentage to apply to the run current when holding.
 #define TMC5160_HOLD_CURRENT_PERCENT 50
@@ -138,13 +141,13 @@
 #define TMC5160_ACCELERATION_NORMAL 1000
 
 // Abrupt acceleration, for use with tmc5160_set_acceleration.
-#define TMC5160_ACCELERATION_ABRUPT 10000
+#define TMC5160_ACCELERATION_ABRUPT 5000
 
 // Normal deceleration, for use with tmc5160_set_deceleration().
 #define TMC5160_DECELERATION_NORMAL 1000
 
 // Abrupt deceleration, for use with tmc5160_set_deceleration().
-#define TMC5160_DECELERATION_ABRUPT 10000
+#define TMC5160_DECELERATION_ABRUPT 5000
 
 // Delay after stopping the motor to when we assume it has stopped
 // (and can therefore safely switch current)
@@ -208,7 +211,7 @@
 #define DEFAULT_HEIGHT_MAX_MM 2000
 
 // Default value for "speed".
-#define DEFAULT_SPEED_MM_PER_SECOND 500
+#define DEFAULT_SPEED_MM_PER_SECOND 400
 
 // Default value for "track number skittering".
 #define DEFAULT_TRACK_NUMBER_SKITTERING 5
@@ -232,7 +235,7 @@
 #define POSITION_UNKNOWN 0x7FFFFFFF
 
 // A maximum speed.
-#define SPEED_MAX_MM_PER_SECOND 1000
+#define SPEED_MAX_MM_PER_SECOND 500
 
 // The minimum usable speed in mm per second.
 #define SPEED_MIN_MM_PER_SECOND 40
@@ -242,7 +245,7 @@
 #endif
 
 // The height of fall needed to trigger the spider's motion sensor.
-#define WAKING_JIGGLE_HEIGHT_MM 50
+#define WAKING_JIGGLE_HEIGHT_MM 200
 
 // The number of falls to trigger the spider's motion sensor reliably.
 #define WAKING_JIGGLE_CYCLES 1
@@ -263,7 +266,7 @@
 #define DANGLE_TIME_SECONDS 8
 
 // Percentage speed reduction when resetting.
-#define RESETTING_SPEED_MODIFIER_PERCENT 50
+#define RESETTING_SPEED_MODIFIER_PERCENT 75
 
 // Percentage speed reduction when just moving up or down.
 #define MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT 100
@@ -1491,7 +1494,7 @@ static launcher_state_t advance_state_commanded_move_up(launcher_t *launcher,
         // Move up
         motor_set_speed(&launcher->motor, launcher->direction_up_not_down,
                         nvs_shadow->speed_mm_per_second, MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT,
-                        TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
+                        TMC5160_LIFT_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
         next_state = LAUNCHER_STATE_MOVE_UP;
     } else {
         ESP_LOGW(TAG, "ignoring move up, already at limit (step %d (%d mm)).",
@@ -1522,7 +1525,7 @@ static launcher_state_t advance_state_commanded_move_down(launcher_t *launcher,
 
     motor_set_speed(&launcher->motor, launcher->direction_up_not_down,
                     nvs_shadow->speed_mm_per_second, MOVE_UP_DOWN_SPEED_MODIFIER_PERCENT,
-                    TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
+                    TMC5160_HANGING_RETURNING_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
     next_state = LAUNCHER_STATE_MOVE_DOWN;
 
     return next_state;
@@ -1584,7 +1587,7 @@ static launcher_state_t advance_state_running_skittering(launcher_t *launcher,
         ESP_LOGI(TAG, "waking: lifting to %d mm.", launcher->height_target_mm);
         motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
                             nvs_shadow->speed_mm_per_second, ground_level_mm,
-                            TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
+                            TMC5160_LIFT_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, TMC5160_DECELERATION_NORMAL);
         next_state = LAUNCHER_STATE_RUNNING_WAKING;
     }
 
@@ -1613,7 +1616,7 @@ static launcher_state_t advance_state_running_waking(launcher_t *launcher,
                                 0,
                                 WAKING_SPEED_DOWN_MM_PER_SECOND,
                                 ground_level_mm,
-                                TMC5160_RUN_CURRENT_MA,
+                                TMC5160_HANGING_RETURNING_CURRENT_MA,
                                 WAKING_DOWN_ACCELERATION,
                                 WAKING_DOWN_DECELERATION);
         }
@@ -1642,7 +1645,7 @@ static launcher_state_t advance_state_running_waking(launcher_t *launcher,
                                             launcher->height_target_mm,
                                             nvs_shadow->speed_mm_per_second,
                                             ground_level_mm,
-                                            TMC5160_RUN_CURRENT_MA,
+                                            TMC5160_LIFT_CURRENT_MA,
                                             TMC5160_ACCELERATION_ABRUPT,
                                             TMC5160_DECELERATION_ABRUPT);
                     }
@@ -1673,7 +1676,7 @@ static launcher_state_t advance_state_running_waking(launcher_t *launcher,
                                     launcher->height_target_mm,
                                     nvs_shadow->speed_mm_per_second,
                                     ground_level_mm,
-                                    TMC5160_RUN_CURRENT_MA,
+                                    TMC5160_LIFT_CURRENT_MA,
                                     TMC5160_ACCELERATION_ABRUPT,
                                     TMC5160_DECELERATION_ABRUPT);
                 next_state = LAUNCHER_STATE_RUNNING_JUMPING;
@@ -1700,7 +1703,7 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
                 if (esp_random() < UINT32_MAX / 2) {
                     ESP_LOGI(TAG, "random stop for %d ms.", RANDOM_PAUSE_TIME_MS);
                     timer_start_us(&launcher->timer_a, RANDOM_PAUSE_TIME_MS * 1000);
-                    motor_stop(&launcher->motor, TMC5160_RUN_CURRENT_MA, false);
+                    motor_stop(&launcher->motor, TMC5160_LIFT_CURRENT_MA, false);
                     launcher->temporary_stop = true;
                 } else {
                     ESP_LOGI(TAG, "won't stop randomly for %d ms.", RANDOM_PAUSE_INTERVAL_MS);
@@ -1713,7 +1716,7 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
                 ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm, launcher->height_target_mm);
                 motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
                                     nvs_shadow->speed_mm_per_second, ground_level_mm,
-                                    TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_ABRUPT, TMC5160_DECELERATION_ABRUPT);
+                                    TMC5160_LIFT_CURRENT_MA, TMC5160_ACCELERATION_ABRUPT, TMC5160_DECELERATION_ABRUPT);
                 timer_start_us(&launcher->timer_b, RANDOM_PAUSE_INTERVAL_MS * 1000);
                 launcher->temporary_stop = false;
             }
@@ -1721,7 +1724,7 @@ static launcher_state_t advance_state_running_jumping(launcher_t *launcher,
     } else {
         // Done.
         launcher->height_target_mm = POSITION_UNKNOWN;
-        motor_stop(&launcher->motor, TMC5160_RUN_CURRENT_MA,  false);
+        motor_stop(&launcher->motor, TMC5160_HANGING_RETURNING_CURRENT_MA,  false);
         print_height(height_mm);
         timer_start_us(&launcher->timer_a, DANGLE_TIME_SECONDS * 1000000);
         // Start audio
@@ -1756,7 +1759,8 @@ static launcher_state_t advance_state_running_dangling(launcher_t *launcher,
         ESP_LOGI(TAG, "height_mm %d, height_target_mm %d.", height_mm, launcher->height_target_mm);
         motor_set_height_mm(&launcher->motor, launcher->height_target_mm,
                             nvs_shadow->speed_mm_per_second * RESETTING_SPEED_MODIFIER_PERCENT / 100,
-                            ground_level_mm, TMC5160_RUN_CURRENT_MA, TMC5160_ACCELERATION_NORMAL, RESETTING_DECELERATION);
+                            ground_level_mm, TMC5160_HANGING_RETURNING_CURRENT_MA,
+                            TMC5160_ACCELERATION_NORMAL, RESETTING_DECELERATION);
         next_state = LAUNCHER_STATE_RUNNING_RESETTING;
     }
 
@@ -1804,7 +1808,7 @@ static launcher_state_t advance_state(launcher_t *launcher, launcher_state_t com
     int32_t height_max_mm = nvs_shadow->height_max_mm;
     // When an up or down move, or a halt, is over, reduce the
     // current if we're at ground level
-    uint32_t up_down_final_current_ma = TMC5160_RUN_CURRENT_MA;
+    uint32_t up_down_final_current_ma = TMC5160_HANGING_RETURNING_CURRENT_MA;
     if ((height_mm != POSITION_UNKNOWN) && (height_mm <= 0)) {
         up_down_final_current_ma = TMC5160_IDLE_CURRENT_MA;
     }
@@ -3393,15 +3397,15 @@ static int32_t init(context_t *context)
                     if (err == ESP_OK) {
                         // Set the motor current
                         err = tmc5160_set_current(motor->handle, TMC5160_RSENSE_MOHM,
-                                                  TMC5160_RUN_CURRENT_MA,
+                                                  TMC5160_HANGING_RETURNING_CURRENT_MA,
                                                   TMC5160_HOLD_CURRENT_PERCENT);
                         if (err >= 0) {
                             ESP_LOGI(TAG, "motor current set to %d mA.", err);
-                            motor->last_current_setting_ma = TMC5160_RUN_CURRENT_MA;
+                            motor->last_current_setting_ma = TMC5160_HANGING_RETURNING_CURRENT_MA;
                             err = ESP_OK;
                         } else {
                             ESP_LOGE(TAG, "unable to set motor current to %d mA (%s)!",
-                                     TMC5160_RUN_CURRENT_MA, esp_err_to_name(-err));
+                                     TMC5160_HANGING_RETURNING_CURRENT_MA, esp_err_to_name(-err));
                         }
                     }
                     if (err == ESP_OK) {
@@ -3475,7 +3479,7 @@ static int32_t init(context_t *context)
                                                 nvs_shadow->speed_mm_per_second *
                                                 RESETTING_SPEED_MODIFIER_PERCENT / 100,
                                                 retained_ram.ground_level_mm,
-                                                TMC5160_RUN_CURRENT_MA,
+                                                TMC5160_HANGING_RETURNING_CURRENT_MA,
                                                 TMC5160_ACCELERATION_NORMAL,
                                                 TMC5160_DECELERATION_NORMAL);
 
