@@ -207,8 +207,8 @@
 // Default value for "auto period".
 #define DEFAULT_AUTO_PERIOD_SECONDS 180
 
-// Default value for "height max".
-#define DEFAULT_HEIGHT_MAX_MM 2000
+// Default value for "height max"(just under the minimum pole height).
+#define DEFAULT_HEIGHT_MAX_MM 1500
 
 // Default value for "speed".
 #define DEFAULT_SPEED_MM_PER_SECOND 400
@@ -234,7 +234,7 @@
 // An out of range value to represent an unknown step count
 #define POSITION_UNKNOWN 0x7FFFFFFF
 
-// A maximum speed.
+// A maximum speed (faster than this and the spider can stall).
 #define SPEED_MAX_MM_PER_SECOND 500
 
 // The minimum usable speed in mm per second.
