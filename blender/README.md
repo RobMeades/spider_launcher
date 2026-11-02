@@ -4,9 +4,11 @@ This directory contains the 3D printed parts and printing instructions for the s
 The main file is `spider_launcher.blend`, the components of which are exported to a number of `spider_launcher*.stl` files at a Blender scale factor of 1000 to give real size in millimetres. `_xY` on the end of an `stl` file name means you will need to print `Y` of those parts (e.g. two of `spider_launcher_nylon_line_guide_x2.stl`).
 
 # Printing
-All parts should be printed in \[black\] ASA, 15% in-fill, fastest speed, no supports required, brim if you think you need it, except for the following:
+All parts _should_ be printed in \[black\] ASA for UV safety, however care needs to be taken with `spider_launcher_winch_wheel.stl`: there must be NO distortion in the printed object, otherwise the motor may feel unnecessary resistance at some part of its rotation, increasing the likelihood of a stall.  If you are not completely sure of your ASA printing capabilities (e.g. your 3D printer is not inside a temperature-controlled chamber) then it may be better to print in PLA; after all, the spider launcher is only going out at night.
 
-- `spider_eye_big_lens_x2` is the only part that should be printed in transparent PETG rather than ASA, following the advice (here)[http://www.meades.org/misc/big_round_button/big_round_button.html#transparent_petg_printing] for maximum transparency, supports on the print bed,
+Use 15% in-fill, fastest speed, no supports required, brim if you think you need it, except for the following:
+
+- `spider_eye_big_lens_x2` is the only part that should be printed in transparent PETG rather than ASA/PLA, following the advice (here)[http://www.meades.org/misc/big_round_button/big_round_button.html#transparent_petg_printing] for maximum transparency, supports on the print bed,
 - `spider_launcher_nylon_line_guide_x2.stl`: print at a higher resolution (e.g. 0.1&nbsp;mm layer height) if you can, for a smoother edge,
 - `spider_launcher_pole_bug_eyes.stl`: best sliced in half, width-wise, in your printer's slicer program, then both halves can be placed on their cut faces, printed (at 0.1&nbsp;mm layer for best curves) with supports on the print bed and cyanoacrylated together afterwards,
 - `spider_launcher_pole_top_bracket.stl`: similarly, can be chopped into two, in the middle of the thickest part, in your printer's slicer program, then the two parts can be cyanoacrylated together afterwards,
