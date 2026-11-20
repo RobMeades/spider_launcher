@@ -31,7 +31,7 @@ menu "Application Configuration"
 
     config SPIDER_LAUNCHER_AUDIO_PIN_3
         int "Audio pin 3"
-        default 4
+        default -1
         depends on SPIDER_LAUNCHER_AUDIO_USE_GPIO
         help
             GPIO pin wired to pin IO3 of the DY-HV8F audio board,
